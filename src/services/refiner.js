@@ -1,91 +1,82 @@
 /**
- * SERVIZIO: REFINER (F3) - REST VERSION OTTIMIZZATA PER CONTENUTO E MEDIA
- * Scopo: Analizzare i testi e isolare informazioni, fatti chiave e validare immagini via chiamata HTTP diretta.
+ * SERVIZIO: REFINER (F3) - AGGIORNATO CON NUOVA TASSONOMIA (SCENARIO/CONTESTO/SFIDE)
+ * Scopo: Analizzare i testi e isolare informazioni nelle tre categorie logiche PRISM.
  */
 
-// Importa la libreria dotenv per caricare le variabili d'ambiente dal file .env
 import dotenv from 'dotenv';
-
-// Inizializza la configurazione di dotenv per rendere disponibili le variabili via process.env
 dotenv.config();
 
 /**
- * Funzione principale per raffinare i risultati, filtrare i fatti e pulire le immagini
- * @param {string} topic - L'argomento o la keyword principale della ricerca
- * @param {Array} rawSources - I risultati grezzi estratti dalle API di Tavily (F2)
- * @returns {Object} Oggetto JSON validato
+ * Funzione principale per raffinare i risultati
  */
 export const refineResults = async (topic, rawSources) => {
-  // Recupera la chiave API e il flag per le immagini
   const API_KEY = process.env.GEMINI_API_KEY;
-  const SHOULD_PROCESS_IMAGES = process.env.PROCESS_IMAGES === 'true'; // Legge il flag dal .env
+  const SHOULD_PROCESS_IMAGES = process.env.PROCESS_IMAGES === 'true'; 
   
-  // Endpoint REST (mantenuto esattamente come nel tuo codice originale)
-  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${API_KEY}`;
+  // URL mantenuto come richiesto (Gemini 2.5/2.0 Flash)
+  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`;
 
-  // 1. Costruisce la stringa di contesto (Logica condizionale per risparmio token)
+  // 1. Costruzione contesto
   const context = rawSources
     .map(s => {
-      // Se il flag è attivo estraiamo le immagini, altrimenti passiamo una stringa vuota
       const imgList = (SHOULD_PROCESS_IMAGES && s.images && s.images.length > 0) 
         ? s.images.join("\n- ") 
-        : "NESSUNA IMMAGINE FORNITA (NON ELABORARE).";
+        : "NESSUNA IMMAGINE FORNITA.";
       
-      return `FONTE [${s.title}] (URL: ${s.url}):\nCONTENUTO TESTUALE:\n${s.content}\n\nURL IMMAGINI DI QUESTA PAGINA:\n- ${imgList}`;
+      return `FONTE [${s.title}] (URL: ${s.url}):\nCONTENUTO TESTUALE:\n${s.content}\n\nURL IMMAGINI:\n- ${imgList}`;
     })
     .join("\n\n---\n\n");
 
-  // Istruzione dinamica per le immagini basata sul flag
+  // Istruzione dinamica per le immagini
   const imageInstruction = SHOULD_PROCESS_IMAGES 
-    ? `Analizza gli URL delle immagini forniti. Approva solo immagini con valore informativo reale (grafici, infografiche, foto evento). Scarta loghi, icone social e banner. Crea un 'altText' descrittivo.`
-    : `NON elaborare immagini. Restituisci l'array "verifiedImages" come array vuoto [].`;
+    ? `Analizza gli URL delle immagini forniti. Approva solo grafici o foto con valore informativo reale. Scarta loghi e banner. Crea un 'altText' descrittivo.`
+    : `NON elaborare immagini. Restituisci l'array "verifiedImages" come vuoto [].`;
 
-  // 2. Definizione del prompt mirato (mantenuta la tua struttura originale)
-  const promptText = `Sei l'analista dati e iconografo deterministico del sistema PRISM. 
-  Il tuo compito è estrarre informazioni chiave verificate, dati oggettivi e selezionare ESCLUSIVAMENTE immagini coerenti sull'argomento: "${topic}".
+  // 2. Definizione del prompt con nuova tassonomia
+  const promptText = `Sei l'analista strategico del sistema PRISM. 
+  Il tuo compito è analizzare il contesto grezzo e organizzarlo tassativamente nelle tre categorie logiche definite per l'argomento: "${topic}".
   
   ---
-  CONTESTO RECUPERATO DAL WEB (DA ANALIZZARE SCRUPOLOSAMENTE):
+  CONTESTO RECUPERATO DAL WEB:
   ${context}
 
   ISTRUZIONI DI ELABORAZIONE:
   
-  1. VERIFIED FACTS & METRICS: Estrai fatti concreti, numeri, statistiche, date o definizioni ufficiali direttamente supportati dal contesto. Escludi opinioni, congetture e pubblicità.
+  1. CLASSIFICAZIONE LOGICA:
+     - [SCENARIO]: Estrai solo dati quantitativi, statistiche, numeri ufficiali, date e metriche economiche/tecniche.
+     - [CONTESTO]: Estrai solo analisi qualitative, trend di mercato, visioni d'insieme, evoluzioni normative e prospettive generali.
+     - [SFIDE]: Estrai solo criticità, limiti tecnologici, ostacoli burocratici, vulnerabilità e punti di frizione.
+
+  2. REGOLE: Escludi ogni opinione personale, pubblicità o contenuto non verificato.
   
-  2. FILTRAGGIO SEMANTICO IMMAGINI: ${imageInstruction}
+  3. FILTRAGGIO IMMAGINI: ${imageInstruction}
   
-  3. Se il CONTESTO RECUPERATO non contiene informazioni pertinenti, sufficienti o veritiere sull'argomento "${topic}", imposta "isContextRelevant" su false, lascia gli array vuoti e NON inventare informazioni per nessuna ragione.
-  
+  4. RELEVANZA: Se il CONTESTO non contiene info pertinenti su "${topic}", imposta "isContextRelevant" su false.
+
   RISPONDI RISPETTANDO RIGIDAMENTE LO SCHEMA JSON RICHIESTO.`;
 
-  // 3. Apertura del blocco try-catch
   try {
-    console.log(`💎 F3: Raffinamento in corso... (Processamento Immagini: ${SHOULD_PROCESS_IMAGES ? 'ATTIVO' : 'DISATTIVATO'})`);
+    console.log(`💎 F3: Raffinamento Tassonomia (Immagini: ${SHOULD_PROCESS_IMAGES ? 'ON' : 'OFF'})`);
 
     const response = await fetch(URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        contents: [{
-          parts: [{ text: promptText }]
-        }],
+        contents: [{ parts: [{ text: promptText }] }],
         generationConfig: {
           responseMimeType: "application/json",
           responseSchema: {
             type: "OBJECT",
             properties: {
               isContextRelevant: { type: "BOOLEAN" },
-              verifiedFacts: { type: "ARRAY", items: { type: "STRING" } },
-              extractedMetrics: {
-                type: "ARRAY",
-                items: {
-                  type: "OBJECT",
-                  properties: {
-                    label: { type: "STRING" },
-                    value: { type: "STRING" }
-                  },
-                  required: ["label", "value"]
-                }
+              data: {
+                type: "OBJECT",
+                properties: {
+                  SCENARIO: { type: "STRING", description: "Dati numerici, statistiche e metriche." },
+                  CONTESTO: { type: "STRING", description: "Analisi qualitativa, trend e visioni." },
+                  SFIDE: { type: "STRING", description: "Criticità, limiti e ostacoli." }
+                },
+                required: ["SCENARIO", "CONTESTO", "SFIDE"]
               },
               verifiedImages: {
                 type: "ARRAY",
@@ -99,28 +90,27 @@ export const refineResults = async (topic, rawSources) => {
                 }
               }
             },
-            required: ["isContextRelevant", "verifiedFacts", "extractedMetrics", "verifiedImages"]
+            required: ["isContextRelevant", "data", "verifiedImages"]
           }
         }
       })
     });
 
-    const data = await response.json();
+    const result = await response.json();
 
     if (!response.ok) {
-      console.error("❌ Errore API Google (F3):", data);
-      throw new Error(`Google API Error: ${data.error?.message || 'Unknown error'}`);
+      console.error("❌ Errore API Google (F3):", result);
+      throw new Error(`Google API Error: ${result.error?.message || 'Unknown error'}`);
     }
 
-    const rawText = data.candidates[0].content.parts[0].text;
+    const rawText = result.candidates[0].content.parts[0].text;
     const refinedData = JSON.parse(rawText);
 
-    console.log(`✅ F3 Completato con Successo. Immagini verificate: ${refinedData.verifiedImages.length}`);
-    
+    console.log(`✅ F3 Completato. Tassonomia pronta per F4.`);
     return refinedData;
 
   } catch (error) {
-    console.error("❌ Errore critico nel Refiner (REST):", error.message);
+    console.error("❌ Errore critico nel Refiner:", error.message);
     throw error;
   }
 };

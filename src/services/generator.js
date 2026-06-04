@@ -12,7 +12,7 @@ dotenv.config();
 // SWITCH: Legge la variabile d'ambiente. Se "true", attiva il MOCK mode.
 const USE_MOCK = process.env.USE_MOCK_GENERATOR === 'true';
 
-export const generateTones = async (input, verifiedFacts, sourcesPreview, verifiedImages = [], verifiedTables = []) => {
+export const generateTones = async (input, refinedData, sourcesPreview, verifiedImages = [], verifiedTables = []) => {
   const targetPlatform = input.platform.toLowerCase();
   const userProfile = (input.profile || 'basic').toLowerCase();
 
@@ -24,7 +24,7 @@ export const generateTones = async (input, verifiedFacts, sourcesPreview, verifi
     throw new Error("Mancano le credenziali API.");
   }
 
-  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${API_KEY}`;
+  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`;
   const fontiTestuali = sourcesPreview.length > 0 ? sourcesPreview.map(s => `FONTE: ${s.title} [URL: ${s.url}]`).join("\n") : "NULL";
 
   const finalTones = {};
@@ -71,9 +71,14 @@ export const generateTones = async (input, verifiedFacts, sourcesPreview, verifi
         (Inserisci qui l'intero contenuto del post completo, non interromperlo mai a metà)
         <<<END_TONE>>>
 
+        [[ DATI DI INPUT STRUTTURATI (REFINED) ]]
+        - SCENARIO (Dati e Numeri): ${refinedData.SCENARIO || 'Non disponibile'}
+        - CONTESTO (Trend e Visioni): ${refinedData.CONTESTO || 'Non disponibile'}
+        - SFIDE (Criticità e Blocchi): ${refinedData.SFIDE || 'Non disponibile'}
+
         [[ DATI DI INPUT ]]
         ARGOMENTO: "${input.topic || 'Nessun argomento'}"
-        FONTI DISPONIBILI: "${(verifiedFacts && verifiedFacts.length > 0) ? verifiedFacts.join(" | ") : 'Nessun fatto'} \n\n ${fontiTestuali}"
+        RIFERIMENTI FONTI: ${fontiTestuali}
         LINGUA_OUTPUT: "${input.language || 'it'}"
       
         GENERA L'OUTPUT RISPETTANDO I DELIMITATORI <<< >>>. NON AGGIUNGERE ALTRO PRIMA O DOPO I DELIMITATORI. COMPLETA TUTTI I DISCORSI.
