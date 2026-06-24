@@ -1,223 +1,285 @@
 /**
- * WORKER CORE: PRISM PIPELINE ENGINERING
- * Scopo: Gestire la coda asincrona di BullMQ per l'elaborazione dei post.
+ * WORKER — Macchina a stati Redis → consolidamento Firestore a fine processo.
  */
 
 import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
-import redisConnection from '../utils/redis.js'; 
-import { updateJobState, getJobState } from '../services/stateManager.js'; 
-import { generateQueries } from '../services/shaper.js'; 
-import { performWebSearch } from '../services/search.js'; 
-import { refineResults } from '../services/refiner.js'; 
-import { generateTones } from '../services/generator.js'; 
-import { db, FieldValue } from '../utils/firebaseAdmin.js';
+import redisConnection from '../utils/redis.js';
+import {
+  getRedisJob,
+  patchRedisJob,
+  writeShapingToRedis,
+  writeTavilyToRedis,
+  writeRefinerToRedis,
+  consolidateToFirestore,
+  failAndConsolidate,
+  hydrateRedisFromFirestore,
+  writeGeneratedTone,
+  TONE_IDS,
+  normalizePlatform,
+} from '../services/stateManager.js';
+import { runShaperGatekeeper } from '../services/shaper.js';
+import { performWebSearch } from '../services/search.js';
+import { refineResults } from '../services/refiner.js';
+import { generateTones } from '../services/generator.js';
 
 dotenv.config();
 
-const QUEUE_NAME = 'prism-jobs'; 
-const IS_MOCK_ENABLED = process.env.USE_MOCK_GENERATOR === 'true';
+const QUEUE_NAME = 'prism-jobs';
+const IS_MOCK = process.env.USE_MOCK_GENERATOR === 'true';
 
-// Helper Mock aggiornato
-const getMockOutput = (stage, topic) => {
-  const mocks = {
-    query_shaping: ["strategia per " + topic, "trend 2026 " + topic],
-    tavily_search: { sources: [{ title: "Mock Source", url: "https://example.com", score: 0.95 }] },
-    refiner: {
-      isContextRelevant: true,
-      data: {
-        SCENARIO: "Dati quantitativi mock: +15% crescita.",
-        CONTESTO: "Analisi qualitativa: trend in ascesa.",
-        SFIDE: "Criticità: colli di bottiglia normativi."
-      },
-      verifiedImages: [{ url: "https://picsum.photos/400/300", altText: "Immagine Mock" }]
-    }
-  };
-  return mocks[stage];
-};
+const mockShaper = (topic) => ({
+  is_blocked: false,
+  block_message: '',
+  diagnosi: { scenario: 'GAP', context: 'GAP', sfide_opportunita: 'GAP' },
+  search_required: true,
+  tone_suitability: {
+    provocatore: { status: 'ON', lock_reason: '' },
+    confidente: { status: 'ON', lock_reason: '' },
+    sferzante: { status: 'ON', lock_reason: '' },
+    visionario: { status: 'ON', lock_reason: '' },
+    metodologico: { status: 'ON', lock_reason: '' },
+    narratore: { status: 'ON', lock_reason: '' },
+  },
+  plan: [
+    { pillar: 'SCENARIO', query: `statistiche ${topic} ${new Date().getFullYear()}` },
+    { pillar: 'CONTESTO', query: `trend ${topic} ${new Date().getFullYear() - 1}` },
+    { pillar: 'SFIDE_OPPORTUNITA', query: `criticità ${topic} ${new Date().getFullYear()}` },
+  ],
+});
+
+const mockTavily = () => ({
+  rawResults: [{
+    title: 'Mock Source',
+    url: 'https://example.com',
+    content: 'Contenuto mock.',
+    retrievedAt: new Date().toISOString(),
+    pillar: 'SCENARIO',
+  }],
+});
+
+const mockRefiner = () => ({
+  compressedFacts: [
+    'SCENARIO: Dati mock +15%.',
+    'CONTESTO: Trend in crescita.',
+    'SFIDE_OPPORTUNITA: Ostacoli normativi e leve di digitalizzazione.',
+  ],
+  sourcesPreview: [{ title: 'Mock Source', url: 'https://example.com' }],
+  isContextRelevant: true,
+  tables: [],
+});
 
 const worker = new Worker(QUEUE_NAME, async (job) => {
-  const { userId, companyId, topic, platform, language, maxChars, toneKey, action, parentJobId } = job.data; 
-  const jobId = job.id; 
-  const isMock = IS_MOCK_ENABLED;
+  const {
+    userId,
+    companyId,
+    topic,
+    platform,
+    language,
+    maxChars,
+    toneKey,
+    action,
+    parentJobId,
+    instructions,
+  } = job.data;
 
-  console.log(`🚀 [WORKER] Job Iniziato. ID: ${jobId} | Azione: ${action || 'standard'}`);
-
+  const jobId = job.id;
   const targetJobId = action === 'regen_tone' ? parentJobId : jobId;
-  const standardRedisKey = `${userId}:jobs:${targetJobId}`;
+  const uid = userId;
 
-  let currentState = await getJobState(userId, targetJobId);
-  
-  if (!currentState && action !== 'regen_tone') {
-    currentState = await updateJobState(userId, targetJobId, {
-      status: 'running',
-      input: { topic, platform, language: language || 'italiano', maxChars }
-    });
-  }
-  
+  console.log(`🚀 [WORKER][${targetJobId}] Azione: ${action || 'standard'}`);
+
+  let state = null;
+
   try {
-    // =========================================================================
-    // 🎯 DEVIAZIONE CHIRURGICA: RIGENERAZIONE SINGOLO TONO
-    // =========================================================================
+    // -------------------------------------------------------------------------
+    // RIGENERAZIONE SINGOLO TONO (post-consolidamento Firestore)
+    // -------------------------------------------------------------------------
     if (action === 'regen_tone' && toneKey) {
-      console.log(`🎯 Rigenerazione Tono: [${toneKey}]`);
-      
-      currentState = await updateJobState(userId, targetJobId, {
-        status: 'generating',
-        pipeline: { step: 'generation', progress: 0.50, message: `F4: Rigenerazione ${toneKey.toUpperCase()}...` }
-      });
+      state = await getRedisJob(uid, targetJobId);
+      if (!state) state = await hydrateRedisFromFirestore(uid, targetJobId);
+      if (!state) throw new Error(`Job ${targetJobId} non trovato.`);
 
-      // ESTRAZIONE SICURA: Recuperiamo i dati raffinati dallo stato interno
-      const refinedDataForRegen = currentState?.internal_data?.refinedData || {};
-      const sourcesPreview = currentState?.sources_preview || [];
-      const verifiedImages = currentState?.internal_data?.verifiedImages || [];
-      const originalInput = currentState?.input || { topic, platform, language, maxChars };
-
-      const singleGeneratedOutput = await generateTones(
-        { ...originalInput, singleToneTarget: toneKey }, 
-        refinedDataForRegen, // Corretto: passiamo l'oggetto
-        sourcesPreview,
-        verifiedImages
-      );
-
-      const newText = singleGeneratedOutput[toneKey]?.text || singleGeneratedOutput?.text;
-      if (!newText) throw new Error(`Errore generazione testo per: ${toneKey}`);
-
-      const parentDataRaw = await redisConnection.get(standardRedisKey);
-      let parentData = parentDataRaw ? JSON.parse(parentDataRaw) : {};
-
-      if (!parentData.tones?.[toneKey]) throw new Error(`Tono ${toneKey} non trovato.`);
-
-      if (!parentData.storico) parentData.storico = {};
-      if (!Array.isArray(parentData.storico[toneKey])) parentData.storico[toneKey] = [];
-
-      parentData.storico[toneKey].push({
-        version: parentData.tones[toneKey].version || 1,
-        text: parentData.tones[toneKey].text,
-        timestamp: new Date().toISOString()
-      });
-
-      parentData.tones[toneKey] = {
-        ...parentData.tones[toneKey],
-        text: newText,
-        status: 'done',
-        is_regenerated: true,
-        version: (parentData.tones[toneKey].version || 1) + 1,
-        last_updated: new Date().toISOString()
-      };
-
-      parentData.status = 'completed';
-      await redisConnection.set(standardRedisKey, JSON.stringify(parentData), 'EX', 86400);
-
-      const contentRef = db.collection('contents').doc(targetJobId);
-      await contentRef.set({ testo: parentData }, { merge: true });
-      return; 
-    }
-
-    // =========================================================================
-    // 🔄 FLUSSO STANDARD (F1 -> F4)
-    // =========================================================================
-
-    // --- F1: QUERY SHAPING ---
-    if (!currentState.internal_data?.queries) {
-      const queries = isMock ? getMockOutput('query_shaping', topic) : await generateQueries(topic);
-      currentState = await updateJobState(userId, targetJobId, {
-        internal_data: { ...currentState.internal_data, queries },
-        pipeline: { step: 'query_shaping', progress: 0.15, message: 'F1 completata.' }
-      });
-    }
-
-    // --- F2: SEARCH ---
-    if (!currentState.internal_data?.rawSources) {
-      const { sources } = isMock ? getMockOutput('tavily_search') : await performWebSearch(currentState.internal_data.queries);
-      currentState = await updateJobState(userId, targetJobId, {
-        sources_preview: sources.slice(0, 5).map(s => ({ title: s.title, url: s.url })),
-        internal_data: { ...currentState.internal_data, rawSources: sources },
-        pipeline: { step: 'tavily_search', progress: 0.40, message: 'F2 completata.' }
-      });
-    }
-
-    // --- F3: REFINER (TASSONOMIA) ---
-    // NOTA: Cambiato il controllo da verifiedFacts a refinedData
-    if (!currentState.internal_data?.refinedData) {
-      currentState = await updateJobState(userId, targetJobId, {
-        pipeline: { step: 'compression', progress: 0.70, message: 'F3: Raffinazione dati...' }
-      });
-    
-      const refinedOutput = isMock ? getMockOutput('refiner') : await refineResults(topic, currentState.internal_data.rawSources);
-
-      currentState = await updateJobState(userId, targetJobId, {
-        internal_data: { 
-          ...currentState.internal_data, 
-          refinedData: refinedOutput.data, // Scenario, Contesto, Sfide
-          verifiedImages: refinedOutput.verifiedImages || [],
-          isContextRelevant: refinedOutput.isContextRelevant
-        }
-      });
-    }
-
-    // --- F4: GENERATION ---
-    const hasTonesGenerated = currentState.tones && 
-      Object.values(currentState.tones).some(tone => tone.text && tone.text.trim() !== "");
-
-    if (!hasTonesGenerated) {
-      currentState = await updateJobState(userId, targetJobId, {
-        status: 'generating',
-        pipeline: { step: 'generation', progress: 0.90, message: `F4: Scrittura contenuti...` }
-      });
-
-      // ESTRAZIONE SICURA DELLE PROPRIETÀ DALLO STATO
-      const refinedDataForGen = currentState.internal_data?.refinedData || {};
-      const verifiedImages = currentState.internal_data?.verifiedImages || [];
-
-      const generatedData = await generateTones(
-        currentState.input, 
-        refinedDataForGen, // Passiamo l'oggetto estratto
-        currentState.sources_preview,
-        verifiedImages
-      );
-
-      const updatedTones = {};
-      for (const tKey of Object.keys(generatedData)) {
-        updatedTones[tKey] = {
-          status: 'done',
-          text: generatedData[tKey].text,
-          authority: generatedData[tKey].authority || 'medium',
-          version: 1,
-          last_updated: new Date().toISOString()
-        };
+      const tone = state.tones?.[toneKey];
+      if (!tone || tone.status !== 'ON') {
+        throw new Error(`Tono ${toneKey} non idoneo (status OFF o assente).`);
       }
 
-      currentState = await updateJobState(userId, targetJobId, {
-        tones: updatedTones
+      await patchRedisJob(uid, targetJobId, {
+        status: 'generating',
+        workerState: { currentStep: 'generation', progress: 0.5, updatedAt: new Date().toISOString() },
+      });
+
+      const refiner = state.refiner;
+      const output = await generateTones(
+        {
+          topic: state.topic,
+          platform: normalizePlatform(platform || state.platform),
+          language: language || state.language,
+          maxChars,
+          singleToneTarget: toneKey,
+          instructions: instructions || '',
+        },
+        refiner.compressedFacts || [],
+        refiner.sourcesPreview || [],
+        refiner.tables || []
+      );
+
+      const newText = output[toneKey]?.text;
+      if (!newText) throw new Error(`Generazione fallita per tono: ${toneKey}`);
+
+      await writeGeneratedTone(uid, targetJobId, toneKey, newText, { instructions });
+      await patchRedisJob(uid, targetJobId, {
+        status: 'completed',
+        workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
+      });
+
+      await consolidateToFirestore(uid, targetJobId, 'completed');
+      console.log(`[WORKER][${targetJobId}] Rigenerazione tono ${toneKey} consolidata.`);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // INIZIALIZZAZIONE REDIS
+    // -------------------------------------------------------------------------
+    state = await getRedisJob(uid, targetJobId);
+    if (!state) {
+      throw new Error(`Job Redis ${targetJobId} non trovato. Deve essere creato dall'API.`);
+    }
+
+    await patchRedisJob(uid, targetJobId, { status: 'running' });
+
+    // -------------------------------------------------------------------------
+    // F1 — SHAPER & GATEKEEPER
+    // -------------------------------------------------------------------------
+    if (!state.shaping?.plan?.length && !state.shaping?.is_blocked) {
+      console.log(`🧠 [WORKER][${targetJobId}] F1 Shaper...`);
+
+      const shaperOut = IS_MOCK ? mockShaper(topic) : await runShaperGatekeeper(topic);
+      state = await writeShapingToRedis(uid, targetJobId, shaperOut);
+
+      if (shaperOut.is_blocked) {
+        await patchRedisJob(uid, targetJobId, {
+          status: 'blocked',
+          error: { message: shaperOut.block_message, step: 'query_shaping' },
+        });
+        await consolidateToFirestore(uid, targetJobId, 'blocked');
+        console.log(`[WORKER][${targetJobId}] Input bloccato dal Gatekeeper.`);
+        return;
+      }
+    }
+
+    state = await getRedisJob(uid, targetJobId);
+    const searchRequired = state.shaping?.search_required !== false;
+    const plan = state.shaping?.plan || [];
+
+    // -------------------------------------------------------------------------
+    // F2 — TAVILY (condizionale)
+    // -------------------------------------------------------------------------
+    if (searchRequired && !state.tavily?.rawResults?.length) {
+      console.log(`🌐 [WORKER][${targetJobId}] F2 Search...`);
+      const { rawResults } = IS_MOCK ? mockTavily() : await performWebSearch(plan);
+      state = await writeTavilyToRedis(uid, targetJobId, rawResults);
+    } else if (!searchRequired) {
+      console.log(`⏭️ [WORKER][${targetJobId}] F2 saltata (search_required=false).`);
+      await patchRedisJob(uid, targetJobId, {
+        tavily: { rawResults: [] },
+        workerState: { currentStep: 'tavily_search', progress: 0.5, updatedAt: new Date().toISOString() },
       });
     }
 
-    // --- FINALIZZAZIONE ---
-    const finalState = await updateJobState(userId, targetJobId, {
+    // -------------------------------------------------------------------------
+    // F3 — REFINER
+    // -------------------------------------------------------------------------
+    state = await getRedisJob(uid, targetJobId);
+    if (!state.refiner?.compressedFacts?.length) {
+      console.log(`💎 [WORKER][${targetJobId}] F3 Refiner...`);
+
+      const refinerOut = IS_MOCK
+        ? mockRefiner()
+        : await refineResults(state.topic || topic, {
+          diagnosi: state.shaping?.diagnosi,
+          rawResults: state.tavily?.rawResults || [],
+          searchRequired,
+        });
+
+      state = await writeRefinerToRedis(uid, targetJobId, refinerOut);
+    }
+
+    // -------------------------------------------------------------------------
+    // STOP — shaping_only → consolidamento Firestore + DEL Redis
+    // -------------------------------------------------------------------------
+    if (action === 'shaping_only') {
+      await patchRedisJob(uid, targetJobId, {
+        status: 'completed',
+        workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
+      });
+      await consolidateToFirestore(uid, targetJobId, 'completed');
+      console.log(`[WORKER][${targetJobId}] Analisi completata. Record portato su Firestore e rimosso da Redis.`);
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // F4 — GENERATION (tutti i toni ON)
+    // -------------------------------------------------------------------------
+    state = await getRedisJob(uid, targetJobId);
+    const tonesOn = TONE_IDS.filter((id) => state.tones?.[id]?.status === 'ON');
+    const needsGeneration = tonesOn.some((id) => !state.tones[id]?.text?.trim());
+
+    if (needsGeneration) {
+      console.log(`🎨 [WORKER][${targetJobId}] F4 Generation (${tonesOn.length} toni ON)...`);
+
+      await patchRedisJob(uid, targetJobId, {
+        status: 'generating',
+        workerState: { currentStep: 'generation', progress: 0.9, updatedAt: new Date().toISOString() },
+      });
+
+      const generated = await generateTones(
+        {
+          topic: state.topic,
+          platform: state.platform,
+          language: state.language,
+          maxChars,
+          allowedTones: tonesOn,
+        },
+        state.refiner.compressedFacts || [],
+        state.refiner.sourcesPreview || [],
+        state.refiner.tables || []
+      );
+
+      const tones = { ...state.tones };
+      for (const id of tonesOn) {
+        if (generated[id]?.text) {
+          tones[id] = {
+            ...tones[id],
+            text: generated[id].text,
+            version: 1,
+            type: 'generation',
+          };
+        }
+      }
+
+      await patchRedisJob(uid, targetJobId, { tones });
+    }
+
+    await patchRedisJob(uid, targetJobId, {
       status: 'completed',
-      pipeline: { step: 'done', progress: 1.0, message: 'Completato!' }
+      workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
     });
 
-    await redisConnection.expire(standardRedisKey, 86400);
-
-    const firestoreData = { ...finalState };
-    if (firestoreData.internal_data) delete firestoreData.internal_data.rawSources;
-
-    await db.collection('contents').doc(targetJobId).set({
-      company_id: companyId,
-      user_id: userId,
-      testo: firestoreData,
-      media_support: { verified_images: currentState.internal_data?.verifiedImages || [] },
-      created_at: FieldValue.serverTimestamp()
-    });
+    await consolidateToFirestore(uid, targetJobId, 'completed');
+    console.log(`[WORKER][${targetJobId}] Pipeline completata. Consolidato su Firestore.`);
 
   } catch (err) {
-    console.error(`❌ Errore nel Worker:`, err.message);
-    await updateJobState(userId, targetJobId, { 
-      status: 'failed', 
-      error: { message: err.message, step: currentState?.pipeline?.step } 
-    });
-    throw err; 
+    console.error(`❌ [WORKER][${targetJobId}]`, err.message);
+    try {
+      const step = state?.workerState?.currentStep || 'unknown';
+      await failAndConsolidate(uid, targetJobId, err.message, step, 'failed');
+    } catch (persistErr) {
+      console.error(`❌ Persistenza errore fallita:`, persistErr.message);
+    }
+    throw err;
   }
 }, { connection: redisConnection, concurrency: 1 });
+
+console.log('🚀 Worker PRISM operativo (Redis online → Firestore consolidato).');

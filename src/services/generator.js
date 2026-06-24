@@ -1,59 +1,72 @@
 /**
- * SERVIZIO: GENERATOR (F4) - PROFILE-AWARE DYNAMIC ENGINE [PAY-AS-YOU-GO & PARSER OPTIMIZED]
- * Scopo: Generazione Multi-Pass con estrazione testuale blindata e diagnostica orientata all'output dell'LLM.
- * MODALITÀ: Switch tra LIVE (Gemini) e MOCK (Simulazione) via .env
+ * SERVIZIO: GENERATOR (F4) - PROFILE-AWARE DYNAMIC ENGINE
+ * Input: compressedFacts + sourcesPreview (schema Firestore unificato).
  */
 
 import dotenv from 'dotenv';
 import redis from '../utils/redis.js';
+import { TONE_IDS } from './stateManager.js';
 
 dotenv.config();
 
-// SWITCH: Legge la variabile d'ambiente. Se "true", attiva il MOCK mode.
 const USE_MOCK = process.env.USE_MOCK_GENERATOR === 'true';
 
-export const generateTones = async (input, refinedData, sourcesPreview, verifiedImages = [], verifiedTables = []) => {
-  const targetPlatform = input.platform.toLowerCase();
+export const generateTones = async (input, compressedFacts = [], sourcesPreview = [], tables = []) => {
+  const targetPlatform = (input.platform || 'general').toLowerCase();
   const userProfile = (input.profile || 'basic').toLowerCase();
 
-  console.log(`🎨 Fase 4: Esecuzione ${USE_MOCK ? '[MOCK MODE]' : '[LIVE MODE]'} per Profilo [${userProfile.toUpperCase()}] su [${targetPlatform.toUpperCase()}]...`);
+  console.log(`🎨 F4: Esecuzione ${USE_MOCK ? '[MOCK]' : '[LIVE]'} | Profilo [${userProfile.toUpperCase()}] | [${targetPlatform.toUpperCase()}]`);
 
   const API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : null;
   if (!USE_MOCK && !API_KEY) {
-    console.error("❌ [CRITICO] GEMINI_API_KEY non configurata per modalità LIVE!");
+    console.error("❌ [CRITICO] GEMINI_API_KEY non configurata!");
     throw new Error("Mancano le credenziali API.");
   }
 
   const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`;
-  const fontiTestuali = sourcesPreview.length > 0 ? sourcesPreview.map(s => `FONTE: ${s.title} [URL: ${s.url}]`).join("\n") : "NULL";
+  const fontiTestuali = sourcesPreview.length > 0
+    ? sourcesPreview.map((s) => `FONTE: ${s.title} [URL: ${s.url}]`).join("\n")
+    : "NULL";
+  const fattiComprimibili = compressedFacts.length > 0
+    ? compressedFacts.map((f, i) => `${i + 1}. ${f}`).join("\n")
+    : "Nessun dato strutturato disponibile.";
+  const tabelleCtx = tables.length > 0 ? JSON.stringify(tables) : "Nessuna tabella.";
+
+  const instructionsBlock = input.instructions?.trim()
+    ? `\n[[ ISTRUZIONI DI RIGENERAZIONE ]]\n${input.instructions.trim()}\n`
+    : '';
 
   const finalTones = {};
-  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   try {
     const [profileAllowedTonesRaw, coreRules, epistemeRules, platformRules] = await Promise.all([
       redis.hget('prism:config:profiles', userProfile),
       redis.get('prism:config:core'),
       redis.get('prism:config:episteme'),
-      redis.hget('prism:config:platforms', targetPlatform)
+      redis.hget('prism:config:platforms', targetPlatform),
     ]);
 
     if (!coreRules || !platformRules || !profileAllowedTonesRaw) {
-      throw new Error("Errore critico: Configurazione incompleta su Redis.");
+      throw new Error("Configurazione incompleta su Redis.");
     }
 
-    let allowedTones = profileAllowedTonesRaw.split(',').map(t => t.trim());
+    let allowedTones = input.allowedTones?.length
+      ? input.allowedTones.filter((t) => TONE_IDS.includes(t))
+      : profileAllowedTonesRaw.split(',').map((t) => t.trim());
 
     if (input.singleToneTarget) {
-      if (allowedTones.includes(input.singleToneTarget)) allowedTones = [input.singleToneTarget];
-      else throw new Error(`Profilo non autorizzato per il tono: ${input.singleToneTarget}`);
+      if (allowedTones.includes(input.singleToneTarget)) {
+        allowedTones = [input.singleToneTarget];
+      } else {
+        throw new Error(`Profilo non autorizzato per il tono: ${input.singleToneTarget}`);
+      }
     }
 
     for (const currentTone of allowedTones) {
       const toneTemplate = await redis.hget('prism:config:tones', currentTone);
       if (!toneTemplate) continue;
 
-      // PROMPT COMPLETO ORIGINALE
       const singlePrompt = `
         ${coreRules || ''}
         ${epistemeRules || ''}
@@ -72,63 +85,61 @@ export const generateTones = async (input, refinedData, sourcesPreview, verified
         <<<END_TONE>>>
 
         [[ DATI DI INPUT STRUTTURATI (REFINED) ]]
-        - SCENARIO (Dati e Numeri): ${refinedData.SCENARIO || 'Non disponibile'}
-        - CONTESTO (Trend e Visioni): ${refinedData.CONTESTO || 'Non disponibile'}
-        - SFIDE (Criticità e Blocchi): ${refinedData.SFIDE || 'Non disponibile'}
+        FATTI COMPRESSI:
+        ${fattiComprimibili}
+
+        TABELLE DI RIFERIMENTO:
+        ${tabelleCtx}
 
         [[ DATI DI INPUT ]]
         ARGOMENTO: "${input.topic || 'Nessun argomento'}"
         RIFERIMENTI FONTI: ${fontiTestuali}
         LINGUA_OUTPUT: "${input.language || 'it'}"
-      
+        ${instructionsBlock}
         GENERA L'OUTPUT RISPETTANDO I DELIMITATORI <<< >>>. NON AGGIUNGERE ALTRO PRIMA O DOPO I DELIMITATORI. COMPLETA TUTTI I DISCORSI.
       `;
 
-      // STAMPA SEMPRE IL PROMPT (Diagnostica)
       console.log(`\n--- PROMPT INPUT PER ${currentTone} ---\n${singlePrompt}\n------------------------------------------\n`);
 
       let extractedText = "";
       let authorityMode = "DOCUMENT-BOUND MODE";
 
       if (USE_MOCK) {
-        // --- LOGICA MOCK: Restituisce un contenuto simulato ma correttamente formattato ---
         console.log(`🧪 [MOCK] Simulazione completata per ${currentTone}`);
-        extractedText = `Contenuto generato in simulazione per il tono ${currentTone}. <<<START_TONE>>>Questo è il testo del post mockato riguardante: ${input.topic}<<<END_TONE>>>`;
+        extractedText = `Contenuto mock per ${currentTone} su: ${input.topic}. <<<START_TONE>>>Testo simulato riguardante ${input.topic}<<<END_TONE>>>`;
         authorityMode = "MOCK-GENERATED";
       } else {
-        // --- LOGICA LIVE: Chiamata reale a Gemini ---
         const response = await fetch(URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ parts: [{ text: singlePrompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
-          })
+            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
+          }),
         });
 
         if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
         const data = await response.json();
         const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        
-        // PARSER ORIGINALE
+
         const startTag = "<<<START_TONE>>>";
         const endTag = "<<<END_TONE>>>";
-        let startIndex = rawText.indexOf(startTag);
-        let endIndex = rawText.indexOf(endTag);
-        
-        extractedText = (startIndex !== -1 && endIndex !== -1) 
-          ? rawText.substring(startIndex + startTag.length, endIndex).trim() 
+        const startIndex = rawText.indexOf(startTag);
+        const endIndex = rawText.indexOf(endTag);
+
+        extractedText = (startIndex !== -1 && endIndex !== -1)
+          ? rawText.substring(startIndex + startTag.length, endIndex).trim()
           : rawText.trim();
       }
 
       finalTones[currentTone] = { text: extractedText, authority: authorityMode };
-      
+
       if (!USE_MOCK) await delay(2000);
     }
 
     return finalTones;
   } catch (error) {
-    console.error("❌ Errore:", error.message);
+    console.error("❌ Errore Generator:", error.message);
     throw error;
   }
 };

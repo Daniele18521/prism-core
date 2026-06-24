@@ -1,71 +1,112 @@
 /**
- * SERVIZIO: SHAPER (F1) - REST VERSION (STABLE)
- * Scopo: Generare query di ricerca ottimizzate con output JSON garantito.
+ * SHAPER & GATEKEEPER (F1) — Gemini JSON Mode
  */
 
 import dotenv from 'dotenv';
 dotenv.config();
 
-export const generateQueries = async (topic) => {
+const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const getApiUrl = (key) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+
+const SHAPER_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    is_blocked: { type: 'BOOLEAN' },
+    block_message: { type: 'STRING' },
+    diagnosi: {
+      type: 'OBJECT',
+      properties: {
+        scenario: { type: 'STRING' },
+        context: { type: 'STRING' },
+        sfide_opportunita: { type: 'STRING' },
+      },
+      required: ['scenario', 'context', 'sfide_opportunita'],
+    },
+    search_required: { type: 'BOOLEAN' },
+    tone_suitability: {
+      type: 'OBJECT',
+      properties: {
+        provocatore: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+        confidente: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+        sferzante: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+        visionario: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+        metodologico: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+        narratore: { type: 'OBJECT', properties: { status: { type: 'STRING' }, lock_reason: { type: 'STRING' } } },
+      },
+    },
+    plan: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          pillar: { type: 'STRING' },
+          query: { type: 'STRING' },
+        },
+        required: ['pillar', 'query'],
+      },
+    },
+  },
+  required: ['is_blocked', 'block_message', 'diagnosi', 'search_required', 'tone_suitability', 'plan'],
+};
+
+export const runShaperGatekeeper = async (topic) => {
   const API_KEY = process.env.GEMINI_API_KEY;
-  
-  // 1. CORREZIONE URL: Usiamo gemini-1.5-flash (il 3.1-flash-lite non esiste o non è stabile)
-  const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`;
+  if (!API_KEY) throw new Error('GEMINI_API_KEY non configurata.');
 
   const currentYear = new Date().getFullYear();
-  const previousYear = currentYear - 1;         
+  const previousYear = currentYear - 1;
 
-  const promptText = `Dato l'argomento "${topic}", genera un array JSON di 3 query di ricerca complementari.
-  
-    STRUTTURA QUERY:
-    1. SCENARIO: Report, statistiche e dati ufficiali ${previousYear}-${currentYear}.
-    2. CONTESTO: Analisi qualitative e dinamiche di mercato ${previousYear}-${currentYear}.
-    3. SFIDE: Criticità, limiti e dibattiti aperti ${currentYear}.
+  const promptText = `Agisci come il Direttore Editoriale di PRISM.
+INPUT UTENTE: "${topic}"
 
-    REGOLE:
-    - Output deve essere ESCLUSIVAMENTE un array di stringhe.
-    - Esempio: ["query 1", "query 2", "query 3"]
-    - Non aggiungere commenti o introduzioni.`;
+VINCOLO TEMPORALE TASSATIVO:
+Anno Corrente: ${currentYear}
+Anno Precedente: ${previousYear}
+Ogni query generata nel 'plan' deve obbligatoriamente contenere almeno uno di questi due anni.
 
-  try {
-    console.log("🧠 F1: Generazione query strutturate (JSON Mode)...");
+1. SAFETY CHECK: Se l'input contiene diffamazione, odio, pornografia o violenza, imposta is_blocked: true e un block_message professionale.
 
-    const response = await fetch(URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: promptText }] }],
-        // 2. FORZATURA JSON MODE
-        generationConfig: {
-          responseMimeType: "application/json", // Obbliga l'IA a rispondere in JSON
-          responseSchema: {                     // Definisce lo schema atteso
-            type: "ARRAY",
-            items: { type: "STRING" }
-          }
-        }
-      })
-    });
+2. DIAGNOSI DEI GAP: Valuta i 3 pilastri (SCENARIO, CONTESTO, SFIDE_OPPORTUNITA).
+Se l'input utente li contiene già in modo solido, segna 'OK' e imposta search_required: false.
+Se mancano, segna 'GAP' e genera una query di ricerca specifica includendo l'anno ${currentYear} o ${previousYear}.
 
-    const data = await response.json();
+3. MATRICE DI IDONEITÀ NUOVI TONI (chiavi: provocatore, confidente, sferzante, visionario, metodologico, narratore):
+- provocatore (Challenge): OFF se lutti, disastri naturali o tragedie umane. Reason: 'Richiesto rispetto solenne'.
+- confidente (Empathy): Sempre ON (fallback universale).
+- sferzante (Punchy): OFF se sofferenza, violenza o crisi umanitarie. Reason: 'Incompatibile con l'ironia'.
+- visionario (Leadership): OFF se tema puramente storiografico/archeologico senza legami futuri. Reason: 'Tema puramente storico'.
+- metodologico (Action): OFF se tema astratto/artistico/filosofico senza problema pratico. Reason: 'Nessuna leva metodologica'.
+- narratore (Storytelling): Sempre ON.
 
-    if (!response.ok) {
-      console.error("❌ Errore API Google (F1):", data);
-      throw new Error(`Google API Error: ${data.error?.message || 'Unknown error'}`);
-    }
+OUTPUT JSON RIGIDO conforme allo schema.`;
 
-    // 3. ESTRAZIONE DIRETTA (Con JSON Mode non servono clean-up di markdown ```json)
-    const rawText = data.candidates[0].content.parts[0].text;
-    const queries = JSON.parse(rawText);
-    
-    if (Array.isArray(queries)) {
-      console.log("✅ Query generate con successo:", queries);
-      return queries;
-    } else {
-      throw new Error("L'output non è un array valido.");
-    }
+  console.log('🧠 F1: Shaper & Gatekeeper...');
 
-  } catch (error) {
-    console.error("❌ Errore critico nello Shaper (REST):", error.message);
-    throw error;
+  const response = await fetch(getApiUrl(API_KEY.trim()), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: promptText }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: SHAPER_SCHEMA,
+      },
+    }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Google API Error (F1): ${data.error?.message || 'Unknown'}`);
   }
+
+  const parsed = JSON.parse(data.candidates[0].content.parts[0].text);
+  console.log(`✅ F1 completata. blocked=${parsed.is_blocked}, search_required=${parsed.search_required}`);
+  return parsed;
+};
+
+/** @deprecated */
+export const generateQueries = async (topic) => {
+  const out = await runShaperGatekeeper(topic);
+  return (out.plan || []).map((p) => p.query);
 };
