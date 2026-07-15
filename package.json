@@ -6,7 +6,16 @@
   "main": "index.js",
   "scripts": {
     "start:api": "nodemon src/api/index.js",
-    "test:redis": "node src/utils/redis.js"
+    "start:worker": "node src/worker/processor.js",
+    "redis:up": "docker compose up -d redis",
+    "redis:down": "docker compose down",
+    "test:redis": "node -e \"import('./src/utils/resolveRedisUrl.js').then(m=>console.log(m.resolveRedisUrl()))\"",
+    "test": "node --test tests/*.test.js",
+    "test:services": "node --test tests/shaper.test.js tests/search.test.js tests/refiner.test.js tests/contentIngest.test.js",
+    "test:pipeline": "node scripts/run-pipeline.mjs --mock --topic=Test pipeline PRISM mock 2026",
+    "test:errors": "node scripts/test-error-handling.mjs",
+    "test:errors:integration": "node scripts/test-error-handling.mjs --integration --mock",
+    "test:errors:simulate": "node scripts/test-error-handling.mjs --simulate --mock --phase=F2"
   },
   "repository": {
     "type": "git",

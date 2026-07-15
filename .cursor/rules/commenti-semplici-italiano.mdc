@@ -1,0 +1,42 @@
+---
+description: Commenti semplici in italiano su ogni file e modifica del progetto
+alwaysApply: true
+---
+
+# Commenti codice — PRISM
+
+Quando crei o modifichi file in questo progetto, aggiungi **sempre** commenti in italiano semplici.
+
+## Stile obbligatorio
+
+- Spiega **cosa fa** la riga/blocco e **perché** esiste, come se il lettore non conoscesse il termine tecnico.
+- Usa un blocco `/** ... */` in cima a ogni file con lo scopo del file nel flusso PRISM (F1→F4).
+- Commenta ogni **funzione esportata** e ogni **helper non ovvio**.
+- Commenta import non banali (es. perché usi un utility condiviso).
+- Evita commenti inutili tipo `// incrementa i` — commenta solo ciò che non è immediato.
+
+## Esempio
+
+```javascript
+// ❌ BAD
+const x = await getRedisJob(uid, id);
+
+// ✅ GOOD
+// Legge lo stato del job da Redis (memoria veloce usata durante l'elaborazione)
+const x = await getRedisJob(uid, id);
+```
+
+## File del pipeline
+
+| Fase | File |
+|------|------|
+| F1 Shaper | `src/services/shaper.js` |
+| F2 Search | `src/services/search.js` |
+| F3 Refiner | `src/services/refiner.js` |
+| F4 Generator | `src/services/generator.js` |
+| Worker | `src/worker/processor.js` |
+| API | `src/api/index.js` |
+| Stato | `src/services/stateManager.js` |
+| Utils | `src/utils/*.js` |
+
+Non lasciare file `.js` in `src/` senza commenti esplicativi dopo una modifica.

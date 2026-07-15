@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <title>PRISM vs Mercato — One-pager</title>
+  <style>
+    @page { size: A4; margin: 18mm 16mm; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 10pt;
+      line-height: 1.45;
+      color: #1a1a1a;
+      max-width: 210mm;
+      margin: 0 auto;
+      padding: 12mm;
+    }
+    h1 {
+      font-size: 22pt;
+      margin: 0 0 4px;
+      color: #111;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      font-size: 11pt;
+      color: #5b21b6;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    .tagline {
+      background: #f5f3ff;
+      border-left: 4px solid #7c3aed;
+      padding: 10px 14px;
+      margin: 16px 0;
+      font-size: 10.5pt;
+    }
+    h2 {
+      font-size: 12pt;
+      color: #7c3aed;
+      margin: 20px 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid #e5e7eb;
+      page-break-after: avoid;
+    }
+    h3 {
+      font-size: 10.5pt;
+      margin: 14px 0 6px;
+      page-break-after: avoid;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 8.5pt;
+      margin: 8px 0 14px;
+    }
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 5px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f9fafb;
+      font-weight: 600;
+    }
+    .center { text-align: center; }
+    .yes { color: #059669; font-weight: 700; }
+    .partial { color: #d97706; }
+    .no { color: #9ca3af; }
+    .win-lose {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin: 8px 0 12px;
+    }
+    .win-lose > div {
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 9pt;
+    }
+    .win-lose h4 {
+      margin: 0 0 6px;
+      font-size: 9pt;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .win h4 { color: #059669; }
+    .lose h4 { color: #dc2626; }
+    ul { margin: 4px 0; padding-left: 18px; }
+    li { margin: 3px 0; }
+    .message {
+      font-style: italic;
+      color: #4b5563;
+      font-size: 9pt;
+      margin: 6px 0 12px;
+    }
+    .pricing-table td:first-child { font-weight: 600; }
+    .pitch {
+      background: #111;
+      color: #f9fafb;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 9.5pt;
+      line-height: 1.55;
+      margin-top: 16px;
+    }
+    .pitch strong { color: #c4b5fd; }
+    .footer {
+      margin-top: 20px;
+      padding-top: 10px;
+      border-top: 1px solid #e5e7eb;
+      font-size: 8pt;
+      color: #6b7280;
+      text-align: center;
+    }
+    .legend { font-size: 8pt; color: #6b7280; margin-bottom: 8px; }
+    .page-break { page-break-before: always; }
+    .claims table td:first-child { color: #dc2626; }
+    .claims table td:last-child { color: #059669; font-weight: 500; }
+  </style>
+</head>
+<body>
+
+  <h1>PRISM vs Mercato</h1>
+  <div class="subtitle">One-pager · Pitch &amp; posizionamento competitivo</div>
+
+  <div class="tagline">
+    <strong>PRISM in una riga:</strong> Il motore che rifrange il tuo contenuto in uno spettro editoriale —
+    stessi fatti, toni diversi, piattaforme diverse, zero versioni perse.
+  </div>
+
+  <p>Non sostituisce la scrittura da zero. Trasforma ciò che hai già scritto (sito, report, comunicato) in varianti editoriali affidabili e confrontabili.</p>
+
+  <h2>I 4 competitor di riferimento</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Competitor</th>
+        <th>Cosa promette</th>
+        <th>Prezzo</th>
+        <th>Perché lo usa il buyer</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>ChatGPT Pro</strong></td>
+        <td>Assistente universale, conversazione</td>
+        <td>~€20/mese</td>
+        <td>Già ce l'ha, flessibile, economico</td>
+      </tr>
+      <tr>
+        <td><strong>Jasper</strong></td>
+        <td>Copy marketing, brand voice, team</td>
+        <td>~€40–130/mese</td>
+        <td>Contenuti marketing a volume, template</td>
+      </tr>
+      <tr>
+        <td><strong>Taplio</strong></td>
+        <td>Crescita LinkedIn, hook, scheduling</td>
+        <td>~€40–65/mese</td>
+        <td>Solo LinkedIn, crescita personale</td>
+      </tr>
+      <tr>
+        <td><strong>Copy.ai</strong></td>
+        <td>Varianti copy social e ads</td>
+        <td>~€30–40/mese</td>
+        <td>Generazione rapida, tanti formati</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Tabella feature comparativa</h2>
+  <p class="legend"><span class="yes">✅</span> nativo &nbsp;·&nbsp; <span class="partial">⚠️</span> parziale / manuale &nbsp;·&nbsp; <span class="no">❌</span> assente</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th class="center">PRISM</th>
+        <th class="center">ChatGPT</th>
+        <th class="center">Jasper</th>
+        <th class="center">Taplio</th>
+        <th class="center">Copy.ai</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Input da contenuto lungo (articolo, report)</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td><td class="center no">❌</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Spettro toni editoriali (6–7 toni distinti)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center no">❌</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Gatekeeper toni (OFF + motivazione)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Layout nativo per piattaforma</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center yes">✅</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Multi-piattaforma (LinkedIn, FB, X)</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center yes">✅</td></tr>
+      <tr><td>Job per argomento (non chat)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Versioni per tono</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Rigenerazione chirurgica (1 tono, 1 istruzione)</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Confronto versioni (stesso tono)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Confronto toni (stesso argomento)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Confronto piattaforme (stesso tono)</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Ancoraggio fatti al testo sorgente</td><td class="center yes">✅</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Edit manuale + tracciamento versioni</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center partial">⚠️</td></tr>
+      <tr><td>Ricerca fonti integrata</td><td class="center yes">✅</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center no">❌</td><td class="center no">❌</td></tr>
+      <tr><td>Scheduling / pubblicazione</td><td class="center no">❌</td><td class="center no">❌</td><td class="center no">❌</td><td class="center yes">✅</td><td class="center no">❌</td></tr>
+      <tr><td>Analytics social</td><td class="center no">❌</td><td class="center no">❌</td><td class="center partial">⚠️</td><td class="center yes">✅</td><td class="center no">❌</td></tr>
+      <tr><td>Brainstorming libero</td><td class="center partial">⚠️</td><td class="center yes">✅</td><td class="center yes">✅</td><td class="center partial">⚠️</td><td class="center yes">✅</td></tr>
+    </tbody>
+  </table>
+
+  <div class="page-break"></div>
+
+  <h2>PRISM vince / perde — per competitor</h2>
+
+  <h3>vs ChatGPT Pro</h3>
+  <div class="win-lose">
+    <div class="win"><h4>PRISM vince</h4><ul><li>Workflow job, non cronologia chat</li><li>Spettro toni + confronti</li><li>Fedeltà fatti al sorgente</li><li>Gatekeeper editoriale</li></ul></div>
+    <div class="lose"><h4>PRISM perde</h4><ul><li>Flessibilità totale</li><li>Prezzo (€20 vs €39+)</li><li>Prosa libera su testi generici</li><li>Ecosistema GPT/plugin</li></ul></div>
+  </div>
+  <p class="message">"ChatGPT genera. PRISM produce e ti fa scegliere."</p>
+
+  <h3>vs Jasper</h3>
+  <div class="win-lose">
+    <div class="win"><h4>PRISM vince</h4><ul><li>Tono = geometria editoriale</li><li>Confronto toni/piattaforme/versioni</li><li>Gatekeeper etico</li><li>Ancoraggio fatti strutturato</li></ul></div>
+    <div class="lose"><h4>PRISM perde</h4><ul><li>Team enterprise</li><li>Volume ads/email</li><li>Integrazioni marketing suite</li><li>Brand kit maturo</li></ul></div>
+  </div>
+  <p class="message">"Jasper è la fabbrica. PRISM è il tavolo di montaggio editoriale."</p>
+
+  <h3>vs Taplio</h3>
+  <div class="win-lose">
+    <div class="win"><h4>PRISM vince</h4><ul><li>Multi-piattaforma</li><li>Multi-tono da contenuto lungo</li><li>Confronto approcci editoriali</li><li>Flusso sito → social</li></ul></div>
+    <div class="lose"><h4>PRISM perde</h4><ul><li>Scheduling e calendario</li><li>Analytics crescita follower</li><li>Hook LinkedIn ottimizzati</li><li>Community / carousel</li></ul></div>
+  </div>
+  <p class="message">"Taplio ti fa crescere su LinkedIn. PRISM ti fa scegliere come raccontare lo stesso fatto ovunque."</p>
+
+  <h3>vs Copy.ai</h3>
+  <div class="win-lose">
+    <div class="win"><h4>PRISM vince</h4><ul><li>Profondità toni editoriali</li><li>Confronto multi-dimensionale</li><li>Fedeltà al sorgente</li><li>Laboratorio versioni</li></ul></div>
+    <div class="lose"><h4>PRISM perde</h4><ul><li>Velocità formati out-of-the-box</li><li>Ads, email, landing a volume</li><li>Prezzo entry più basso</li><li>Semplicità per non-copywriter</li></ul></div>
+  </div>
+  <p class="message">"Copy.ai ti dà varianti. PRISM ti dà un sistema per scegliere la giusta."</p>
+
+  <h2>Job-to-be-done</h2>
+  <table>
+    <tr><td width="48%"><strong>✅ Scegli PRISM se</strong><ul><li>Hai già scritto e devi adattare ai social</li><li>Ti servono 2+ toni da confrontare</li><li>Pubblichi su più piattaforme</li><li>Hai perso versioni in ChatGPT</li><li>I dati devono restare fedeli all'originale</li></ul></td>
+    <td><strong>❌ Non scegliere PRISM se</strong><ul><li>Parti da zero senza sorgente</li><li>Ti serve solo scheduling LinkedIn</li><li>Vuoi un CMS blog SEO</li><li>Cerchi il tool più economico</li></ul></td></tr>
+  </table>
+
+  <h2>ICP e Pricing</h2>
+  <table class="pricing-table">
+    <thead><tr><th>Priorità</th><th>Segmento</th><th>Caso d'uso</th><th>Piano</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Chi scrive sito + social</td><td>Articolo → ganci LinkedIn/FB</td><td>Divulgatore · 39€/mese</td></tr>
+      <tr><td>2</td><td>Marketing manager PMI B2B</td><td>Comunicato → pack multi-canale</td><td>Convertitore · 149€/mese</td></tr>
+      <tr><td>3</td><td>Agenzia / ufficio stampa</td><td>1 input → N clienti / N toni</td><td>Engine · 249€/mese</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Claim difendibili</h2>
+  <table class="claims">
+    <tr><th>❌ Evitare</th><th>✅ Usare</th></tr>
+    <tr><td>"L'unico tool al mondo"</td><td>"Un input, uno spettro editoriale"</td></tr>
+    <tr><td>"AI migliore di ChatGPT"</td><td>"ChatGPT genera. PRISM ti fa scegliere."</td></tr>
+    <tr><td>"Content strategy a 360°"</td><td>"Dal tuo articolo al pack social in 10 minuti"</td></tr>
+  </table>
+
+  <div class="pitch">
+    <strong>Chiusura pitch (30 secondi)</strong><br><br>
+    Oggi chi scrive contenuti professionali usa ChatGPT e perde le versioni nella cronologia, oppure paga tool verticali che fanno una cosa sola.<br><br>
+    PRISM parte da un contenuto che hai già scritto, lo rifrange in uno spettro di toni editoriali ancorati ai tuoi fatti, e ti fa confrontare versioni, toni e piattaforme in un unico laboratorio — senza chat, senza copia-incolla, senza tradire i dati.<br><br>
+    <strong>Non è un altro generatore di testi. È il tavolo da montaggio editoriale che mancava.</strong>
+  </div>
+
+  <div class="footer">
+    PRISM AI · www.tryprism.it · One-pager competitivo · Luglio 2026
+  </div>
+
+</body>
+</html>

@@ -1,11 +1,17 @@
-//Definiamo la coda chiamata prism-jobs. È come creare una corsia preferenziale in autostrada.
-//Essa sarà usata dall'API per "aggiungere" lavori e dal Worker per "prelevarli".
+/**
+ * CODA BULLMQ — lista di job da processare.
+ *
+ * Immagina una fila in posta:
+ * - L'API "mette in coda" un job (add)
+ * - Il worker "preleva" il prossimo job (Worker in processor.js)
+ *
+ * Usa la stessa connessione Redis di tutto il resto del progetto.
+ */
 
 import { Queue } from 'bullmq';
 import redisConnection from './redis.js';
 
-// Creiamo l'istanza della coda. 
-// Questa sarà usata dall'API per "aggiungere" lavori e dal Worker per "prelevarli".
+// Nome coda condiviso con worker/processor.js e api/index.js
 export const prismQueue = new Queue('prism-jobs', {
-  connection: redisConnection
+  connection: redisConnection,
 });

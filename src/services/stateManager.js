@@ -1,10 +1,27 @@
 /**
- * STATE MANAGER — Redis online, Firestore consolidato a fine processo.
+ * STATE MANAGER — gestisce dove vivono i dati del job durante e dopo l'elaborazione.
+ *
+ * Due "posti" per i dati:
+ * - REDIS = memoria veloce, temporanea (mentre il worker lavora)
+ * - FIRESTORE = database permanente (quando il job è finito)
+ *
+ * Flusso tipico:
+ * 1. API crea job in Redis (initializeRedisJob)
+ * 2. Worker aggiorna Redis ad ogni fase (writeContentIngest, writeShaping, writeTavily, writeRefiner...)
+ * 3. A fine job → consolidateToFirestore copia tutto su Firestore e cancella Redis
  */
 
 import redisConnection from '../utils/redis.js';
 import { db } from '../utils/firebaseAdmin.js';
+// Utility errori: log strutturato + stati terminali job
+import { isTerminalJobStatus, logError } from '../utils/errors.js';
+// Rileva URL in input per impostare lo step iniziale F0 (content_ingest)
+import { isUrlInput } from './contentIngest.js';
 
+// Riesportiamo isTerminalJobStatus così il worker può usarlo senza import doppio
+export { isTerminalJobStatus };
+
+// Lista dei 6 toni editoriali supportati da PRISM
 export const TONE_IDS = [
   'provocatore',
   'confidente',
@@ -14,9 +31,10 @@ export const TONE_IDS = [
   'narratore',
 ];
 
-const REDIS_TTL = 86400;
-const MAX_INSTRUCTIONS_LENGTH = 100;
+const REDIS_TTL = 86400; // job in Redis scadono dopo 24 ore se non consolidati
+const MAX_INSTRUCTIONS_LENGTH = 100; // limite caratteri istruzioni rigenerazione tono
 
+/** Normalizza nome piattaforma (es. "linkedin" → "LinkedIn") per coerenza in DB */
 export const normalizePlatform = (platform) => {
   const map = {
     linkedin: 'LinkedIn',
@@ -28,9 +46,10 @@ export const normalizePlatform = (platform) => {
   return map[(platform || 'general').toLowerCase().trim()] || platform;
 };
 
-const nowIso = () => new Date().toISOString();
-const redisKey = (userId, jobId) => `${userId}:jobs:${jobId}`;
+const nowIso = () => new Date().toISOString(); // timestamp ISO per createdAt/updatedAt
+const redisKey = (userId, jobId) => `${userId}:jobs:${jobId}`; // chiave univoca job in Redis
 
+/** Crea struttura toni vuota: tutti OFF, testo vuoto, versione 0 */
 export const buildEmptyTones = () => {
   const tones = {};
   for (const id of TONE_IDS) {
@@ -45,6 +64,7 @@ export const buildEmptyTones = () => {
   return tones;
 };
 
+// Gemini a volte usa nomi diversi (es. "il_provocatore") → mappiamo al nome canonico
 const TONE_ALIASES = {
   provocatore: 'provocatore',
   il_provocatore: 'provocatore',
@@ -60,6 +80,7 @@ const TONE_ALIASES = {
   il_narratore: 'narratore',
 };
 
+/** Converte l'output toni dello Shaper (F1) nella struttura usata dal worker e Firestore */
 export const buildTonesFromSuitability = (toneSuitability = {}) => {
   const tones = buildEmptyTones();
   for (const [rawKey, val] of Object.entries(toneSuitability)) {
@@ -76,9 +97,10 @@ export const buildTonesFromSuitability = (toneSuitability = {}) => {
   return tones;
 };
 
+/** Unisce patch nel job esistente senza sovrascrivere interi oggetti annidati (shaping, tones...) */
 const deepMerge = (base, patch) => {
   const out = { ...base, ...patch };
-  for (const key of ['shaping', 'tavily', 'refiner', 'workerState', 'error', 'tones']) {
+  for (const key of ['shaping', 'tavily', 'refiner', 'contentIngest', 'sourceMeta', 'workerState', 'error', 'tones']) {
     if (patch[key] !== undefined) {
       out[key] = { ...(base[key] || {}), ...patch[key] };
     }
@@ -86,6 +108,10 @@ const deepMerge = (base, patch) => {
   return out;
 };
 
+/**
+ * Crea un nuovo job in Redis quando l'API riceve una richiesta.
+ * Stato iniziale: pending, shaping vuoto, toni tutti OFF.
+ */
 export const initializeRedisJob = async (userId, jobId, {
   companyId,
   topic,
@@ -94,17 +120,29 @@ export const initializeRedisJob = async (userId, jobId, {
   action,
 }) => {
   const timestamp = nowIso();
+  // Capisce se l'utente ha incollato un URL (attiva F0 nel worker)
+  const inputType = isUrlInput(topic) ? 'url' : 'text';
+  // Step iniziale mostrato al frontend durante il polling
+  const initialStep = inputType === 'url' ? 'content_ingest' : 'query_shaping';
   const job = {
     jobId,
     companyId,
     userId,
     topic,
-    status: 'pending',
+    // Conserva l'input originale (URL o testo) per audit e UI "basato su..."
+    originalInput: topic,
+    inputType,
+    sourceMeta: null,
+    status: inputType === 'url' ? 'ingesting' : 'pending',
     language,
     platform: normalizePlatform(platform),
     action: action || 'standard',
     createdAt: timestamp,
     updatedAt: timestamp,
+    contentIngest: {
+      updatedAt: null,
+      sourceUrl: inputType === 'url' ? String(topic).trim() : null,
+    },
     shaping: {
       suggestedQueries: [],
       updatedAt: null,
@@ -116,7 +154,7 @@ export const initializeRedisJob = async (userId, jobId, {
       tables: [],
     },
     workerState: {
-      currentStep: 'query_shaping',
+      currentStep: initialStep,
       progress: 0.0,
       retryCount: 0,
       updatedAt: timestamp,
@@ -129,11 +167,21 @@ export const initializeRedisJob = async (userId, jobId, {
   return job;
 };
 
+/** Legge il job da Redis. Restituisce null se non esiste o se i dati sono corrotti */
 export const getRedisJob = async (userId, jobId) => {
   const raw = await redisConnection.get(redisKey(userId, jobId));
-  return raw ? JSON.parse(raw) : null;
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw); // converte stringa JSON salvata in Redis → oggetto
+  } catch (err) {
+    // Dati corrotti in Redis (raro): meglio cancellare che crashare tutto il worker
+    logError('stateManager:getRedisJob', err, { jobId, userId });
+    await deleteRedisJob(userId, jobId).catch(() => {});
+    return null;
+  }
 };
 
+/** Aggiorna parzialmente un job in Redis (merge, non sostituzione totale) */
 export const patchRedisJob = async (userId, jobId, patch) => {
   const current = await getRedisJob(userId, jobId);
   if (!current) throw new Error(`Job Redis non trovato: ${jobId}`);
@@ -143,12 +191,42 @@ export const patchRedisJob = async (userId, jobId, patch) => {
   return merged;
 };
 
+/** Rimuove il job da Redis (dopo consolidamento su Firestore) */
 export const deleteRedisJob = async (userId, jobId) => {
   await redisConnection.del(redisKey(userId, jobId));
 };
 
+/** Salva output F0 (Content Ingest): testo estratto da URL e metadati sorgente */
+export const writeContentIngestToRedis = async (userId, jobId, ingestOutput) => {
+  return patchRedisJob(userId, jobId, {
+    // Il topic diventa il testo pulito per F1→F4 (l'URL resta in originalInput/sourceMeta)
+    topic: ingestOutput.topic,
+    originalInput: ingestOutput.originalInput,
+    inputType: ingestOutput.inputType,
+    sourceMeta: ingestOutput.sourceMeta,
+    contentIngest: {
+      updatedAt: nowIso(),
+      sourceUrl: ingestOutput.sourceMeta?.url || null,
+      sourceTitle: ingestOutput.sourceMeta?.title || '',
+      charCount: ingestOutput.sourceMeta?.charCount || 0,
+      truncated: ingestOutput.sourceMeta?.truncated || false,
+    },
+    workerState: {
+      currentStep: 'query_shaping',
+      progress: 0.12,
+      updatedAt: nowIso(),
+    },
+    // F0 completato → il job rientra nel flusso standard "running"
+    status: 'running',
+  });
+};
+
+/** Salva output F1 (Shaper): diagnosi GAP, plan query, toni ON/OFF */
 export const writeShapingToRedis = async (userId, jobId, shaperOutput) => {
-  const suggestedQueries = (shaperOutput.plan || []).map((p) => p.query).filter(Boolean);
+  // Se non serve ricerca web, plan e suggestedQueries devono restare vuoti
+  const searchRequired = shaperOutput.search_required !== false;
+  const plan = searchRequired ? (shaperOutput.plan || []) : [];
+  const suggestedQueries = plan.map((p) => p.query).filter(Boolean);
   const tones = buildTonesFromSuitability(shaperOutput.tone_suitability);
 
   return patchRedisJob(userId, jobId, {
@@ -156,9 +234,9 @@ export const writeShapingToRedis = async (userId, jobId, shaperOutput) => {
       is_blocked: shaperOutput.is_blocked,
       block_message: shaperOutput.block_message || '',
       diagnosi: shaperOutput.diagnosi || {},
-      search_required: shaperOutput.search_required,
+      search_required: searchRequired,
       tone_suitability: shaperOutput.tone_suitability || {},
-      plan: shaperOutput.plan || [],
+      plan,
       suggestedQueries,
       updatedAt: nowIso(),
     },
@@ -172,6 +250,7 @@ export const writeShapingToRedis = async (userId, jobId, shaperOutput) => {
   });
 };
 
+/** Salva output F2 (Tavily): fonti web trovate con ID S1, S2... */
 export const writeTavilyToRedis = async (userId, jobId, rawResults) => {
   return patchRedisJob(userId, jobId, {
     tavily: { rawResults },
@@ -183,6 +262,7 @@ export const writeTavilyToRedis = async (userId, jobId, rawResults) => {
   });
 };
 
+/** Salva output F3 (Refiner): 3 blocchi SCENARIO/CONTESTO/SFIDE_OPPORTUNITA */
 export const writeRefinerToRedis = async (userId, jobId, refinerOutput) => {
   return patchRedisJob(userId, jobId, {
     refiner: {
@@ -199,6 +279,7 @@ export const writeRefinerToRedis = async (userId, jobId, refinerOutput) => {
   });
 };
 
+/** Segna il job come failed in Redis (prima del consolidamento su Firestore) */
 export const setJobError = async (userId, jobId, message, step) => {
   return patchRedisJob(userId, jobId, {
     status: 'failed',
@@ -210,6 +291,7 @@ export const setJobError = async (userId, jobId, message, step) => {
   });
 };
 
+/** Trasforma il job Redis nel formato documento Firestore (collection: contents) */
 const buildFirestorePayload = (job, finalStatus) => {
   const timestamp = nowIso();
   return {
@@ -217,6 +299,9 @@ const buildFirestorePayload = (job, finalStatus) => {
     companyId: job.companyId,
     userId: job.userId,
     topic: job.topic,
+    originalInput: job.originalInput || job.topic,
+    inputType: job.inputType || 'text',
+    sourceMeta: job.sourceMeta || null,
     status: finalStatus,
     language: job.language,
     platform: job.platform,
@@ -230,6 +315,7 @@ const buildFirestorePayload = (job, finalStatus) => {
       updatedAt: timestamp,
     },
     research: {
+      contentIngest: job.contentIngest || null,
       shaping: job.shaping,
       tavily: job.tavily,
       refiner: job.refiner,
@@ -239,17 +325,44 @@ const buildFirestorePayload = (job, finalStatus) => {
   };
 };
 
+/**
+ * Prova a cancellare il job da Redis più volte.
+ * Perché: a volte la rete cade proprio nel momento del delete dopo il salvataggio su Firestore.
+ * Senza retry resterebbe duplicato (sia Redis che Firestore).
+ */
+const retryDeleteRedis = async (userId, jobId, maxAttempts = 3) => {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await deleteRedisJob(userId, jobId);
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts - 1) throw err; // ultimo tentativo fallito → lancia errore
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1))); // aspetta e riprova
+    }
+  }
+};
+
+/**
+ * Fine pipeline: copia tutto da Redis (veloce) a Firestore (permanente) e cancella Redis.
+ * Firestore = database definitivo dove il frontend legge i risultati.
+ */
 export const consolidateToFirestore = async (userId, jobId, finalStatus = 'completed') => {
   const job = await getRedisJob(userId, jobId);
   if (!job) throw new Error(`Impossibile consolidare: job ${jobId} assente da Redis.`);
 
   const payload = buildFirestorePayload(job, finalStatus);
   await db.collection('contents').doc(jobId).set(payload, { merge: true });
-  await deleteRedisJob(userId, jobId);
+  await retryDeleteRedis(userId, jobId);
   console.log(`[WORKER][${jobId}] Record portato su Firestore (status: ${finalStatus}) e rimosso da Redis.`);
   return payload;
 };
 
+/**
+ * Quando un job fallisce: salva l'errore e sposta tutto su Firestore.
+ *
+ * Restituisce { persisted: true/false } così il worker sa se ha senso riprovare.
+ * Se persisted=true, il job è chiuso → NON rilanciare l'errore a BullMQ (evita retry inutili).
+ */
 export const failAndConsolidate = async (userId, jobId, message, step, status = 'failed') => {
   try {
     const existing = await getRedisJob(userId, jobId);
@@ -259,26 +372,39 @@ export const failAndConsolidate = async (userId, jobId, message, step, status = 
         error: { message, step },
         workerState: { currentStep: step, updatedAt: nowIso() },
       });
-      return consolidateToFirestore(userId, jobId, status);
+      await consolidateToFirestore(userId, jobId, status);
+      return { persisted: true, source: 'redis' };
     }
   } catch (err) {
-    console.error(`❌ failAndConsolidate(${jobId}):`, err.message);
+    logError('stateManager:failAndConsolidate', err, { jobId, step });
   }
 
-  await db.collection('contents').doc(jobId).set({
-    jobId,
-    userId,
-    status,
-    error: { message, step },
-    updatedAt: nowIso(),
-  }, { merge: true });
+  try {
+    await db.collection('contents').doc(jobId).set({
+      jobId,
+      userId,
+      status,
+      error: { message, step },
+      updatedAt: nowIso(),
+    }, { merge: true });
+    await deleteRedisJob(userId, jobId).catch(() => {});
+    return { persisted: true, source: 'firestore' };
+  } catch (err) {
+    logError('stateManager:failAndConsolidate:fallback', err, { jobId, step });
+    return { persisted: false, source: 'none', error: err.message };
+  }
 };
 
+/** Legge un job già consolidato da Firestore (dopo che Redis è stato cancellato) */
 export const getFirestoreJob = async (jobId) => {
   const snap = await db.collection('contents').doc(jobId).get();
   return snap.exists ? snap.data() : null;
 };
 
+/**
+ * Ricopia un job da Firestore a Redis.
+ * Serve per rigenerare un tono su un job già completato (regen_tone).
+ */
 export const hydrateRedisFromFirestore = async (userId, jobId) => {
   const fs = await getFirestoreJob(jobId);
   if (!fs) return null;
@@ -288,12 +414,16 @@ export const hydrateRedisFromFirestore = async (userId, jobId) => {
     companyId: fs.companyId,
     userId: fs.userId || userId,
     topic: fs.topic,
+    originalInput: fs.originalInput || fs.topic,
+    inputType: fs.inputType || 'text',
+    sourceMeta: fs.sourceMeta || null,
     status: fs.status,
     language: fs.language,
     platform: fs.platform,
     action: fs.action || 'standard',
     createdAt: fs.createdAt,
     updatedAt: nowIso(),
+    contentIngest: fs.research?.contentIngest || fs.contentIngest || { updatedAt: null },
     shaping: fs.research?.shaping || fs.shaping || { suggestedQueries: [] },
     tavily: fs.research?.tavily || fs.tavily || { rawResults: [] },
     refiner: fs.research?.refiner || fs.refiner || { compressedFacts: [], sourcesPreview: [], tables: [] },
@@ -306,12 +436,14 @@ export const hydrateRedisFromFirestore = async (userId, jobId) => {
   return job;
 };
 
+/** Cerca job prima in Redis (in corso), poi in Firestore (completato) */
 export const getJobState = async (userId, jobId) => {
   const redis = await getRedisJob(userId, jobId);
   if (redis) return redis;
   return getFirestoreJob(jobId);
 };
 
+/** Formatta lo stato job per il frontend (polling /jobs/status) */
 export const getJobStatusForClient = async (userId, jobId) => {
   let job = await getRedisJob(userId, jobId);
   if (!job) job = await getFirestoreJob(jobId);
@@ -331,6 +463,9 @@ export const getJobStatusForClient = async (userId, jobId) => {
     jobId,
     status,
     topic: job.topic,
+    originalInput: job.originalInput || job.topic,
+    inputType: job.inputType || 'text',
+    sourceMeta: job.sourceMeta || null,
     platform: normalizePlatform(job.platform),
     language: job.language,
     action: job.action,
@@ -342,12 +477,14 @@ export const getJobStatusForClient = async (userId, jobId) => {
     error: job.error?.message ? job.error : null,
   };
 
+  const contentIngest = job.contentIngest || job.research?.contentIngest;
   const shaping = job.shaping || job.research?.shaping;
   const tavily = job.tavily || job.research?.tavily;
   const refiner = job.refiner || job.research?.refiner;
 
-  if (shaping || tavily || refiner) {
+  if (contentIngest || shaping || tavily || refiner) {
     response.research = {};
+    if (contentIngest) response.research.contentIngest = contentIngest;
     if (shaping) response.research.shaping = shaping;
     if (tavily) response.research.tavily = tavily;
     if (refiner) response.research.refiner = refiner;
@@ -365,6 +502,7 @@ export const getJobStatusForClient = async (userId, jobId) => {
   return response;
 };
 
+/** Aggiorna testo tono direttamente su Firestore (job già consolidato) */
 export const updateToneTextOnFirestore = async (jobId, toneKey, text) => {
   const fs = await getFirestoreJob(jobId);
   if (!fs?.tones?.[toneKey]) throw new Error(`Tono ${toneKey} non trovato.`);
@@ -378,6 +516,7 @@ export const updateToneTextOnFirestore = async (jobId, toneKey, text) => {
   }, { merge: true });
 };
 
+/** Aggiorna testo tono: su Redis se job attivo, altrimenti su Firestore */
 export const updateToneOnRedis = async (userId, jobId, toneKey, text) => {
   const job = await getRedisJob(userId, jobId);
   if (!job) return updateToneTextOnFirestore(jobId, toneKey, text);
@@ -390,6 +529,7 @@ export const updateToneOnRedis = async (userId, jobId, toneKey, text) => {
   return patchRedisJob(userId, jobId, { tones });
 };
 
+/** Salva testo generato/rigenerato per un singolo tono e incrementa version */
 export const writeGeneratedTone = async (userId, jobId, toneKey, text, { instructions = '' } = {}) => {
   const job = await getRedisJob(userId, jobId);
   if (!job) throw new Error('Job non in Redis — rigenerazione richiede job attivo o re-idratazione.');

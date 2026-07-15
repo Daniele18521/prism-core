@@ -1,0 +1,13 @@
+# Redis locale per sviluppo PRISM (usa con REDIS_URL_LOCAL nel .env)
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: prism-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - prism_redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  prism_redis_data:
