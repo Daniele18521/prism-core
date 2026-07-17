@@ -10,6 +10,8 @@
 import dotenv from 'dotenv';
 // Client condiviso: timeout 60s + retry automatico se Google non risponde
 import { callGeminiJson } from '../utils/geminiClient.js';
+// Regole hard sui toni: Gemini propone, il gatekeeper decide (default ON)
+import { enforceToneSuitability } from '../utils/toneGatekeeper.js';
 dotenv.config();
 
 // Modello AI usato in F1 (leggero e veloce)
@@ -130,8 +132,12 @@ export const normalizeToneSuitability = (toneSuitability = {}) => {
  * - search_required true solo se c'è almeno un GAP
  * - plan vuoto se tutti OK
  * - plan solo per pilastri GAP
+ * - toni ON/OFF con gatekeeper deterministico (topic obbligatorio per i toni)
+ *
+ * @param {object} parsed — JSON grezzo da Gemini
+ * @param {string} [topic=''] — testo input (topic o estratto F0); serve al gatekeeper toni
  */
-export const normalizeShaperOutput = (parsed) => {
+export const normalizeShaperOutput = (parsed, topic = '') => {
   const diagnosi = parsed.diagnosi || {};
   const gapPillars = PILLAR_FIELDS.filter(({ key }) => isGap(diagnosi[key]));
   const search_required = gapPillars.length > 0;
@@ -146,12 +152,16 @@ export const normalizeShaperOutput = (parsed) => {
     }
   }
 
+  // Prima ripara formato ON/OFF, poi applica regole hard (Gemini non ha l'ultima parola)
+  const tonesFromModel = normalizeToneSuitability(parsed.tone_suitability);
+  const tone_suitability = enforceToneSuitability(topic, tonesFromModel);
+
   return {
     ...parsed,
     diagnosi,
     search_required,
     plan,
-    tone_suitability: normalizeToneSuitability(parsed.tone_suitability),
+    tone_suitability,
   };
 };
 
@@ -189,32 +199,40 @@ REGOLE TASSATIVE:
 - status contiene SOLO "ON" o "OFF" (nessun altro testo, mai concatenare il motivo).
 - lock_reason è "" (stringa vuota) se status è "ON".
 - lock_reason è una frase breve (max 120 caratteri) se status è "OFF".
-
-Criteri editoriali:
-- provocatore (Challenge): OFF se lutti, disastri naturali o tragedie umane → lock_reason: "Richiesto rispetto solenne".
-- confidente (Empathy): sempre ON, lock_reason: "".
-- sferzante (Punchy): OFF se sofferenza, violenza o crisi umanitarie → lock_reason: "Incompatibile con l'ironia".
-- visionario (Leadership): OFF se tema puramente storiografico/archeologico senza legami futuri → lock_reason: "Tema puramente storico".
-- metodologico (Action): OFF se tema astratto/artistico/filosofico senza problema pratico → lock_reason: "Nessuna leva metodologica".
-- narratore (Storytelling): sempre ON, lock_reason: "".
+- DEFAULT: ogni tono è ON. Preferisci ON in caso di dubbio.
+- confidente e narratore: sempre ON.
+- provocatore e sferzante OFF insieme su: lutto/funerali/vittime di tragedia OPPURE guerra/genocidio/crisi umanitaria/violenza su civili.
+- visionario OFF solo tema puramente storico/archeologico senza attualità (lock_reason: "Tema puramente storico").
+- metodologico OFF solo tema astratto senza problema pratico (lock_reason: "Nessuna leva metodologica").
+- Politica, business, tech, scienza, attualità: TUTTI i toni ON.
 
 OUTPUT JSON RIGIDO conforme allo schema.`;
 
   console.log('🧠 F1: Shaper & Gatekeeper...');
 
   // callGeminiJson sostituisce fetch() diretto: gestisce timeout, retry e parsing sicuro
-  const parsed = normalizeShaperOutput(await callGeminiJson({
-    url: getApiUrl(API_KEY.trim()),
-    step: 'F1',
-    body: {
-      contents: [{ parts: [{ text: promptText }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SHAPER_SCHEMA,
+  // topic passato a normalize → gatekeeper toni corregge falsi OFF di Gemini
+  const parsed = normalizeShaperOutput(
+    await callGeminiJson({
+      url: getApiUrl(API_KEY.trim()),
+      step: 'F1',
+      body: {
+        contents: [{ parts: [{ text: promptText }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: SHAPER_SCHEMA,
+        },
       },
-    },
-  }));
-  const { diagnosi, plan = [], search_required } = parsed;
+    }),
+    topic,
+  );
+  const { diagnosi, plan = [], search_required, tone_suitability } = parsed;
+
+  // Log toni finali (dopo gatekeeper) per debug UI/switch
+  const tonesSummary = TONE_IDS.map(
+    (id) => `${id}=${tone_suitability?.[id]?.status || 'OFF'}`,
+  ).join(', ');
+  console.log(`🎛️ Toni finali: ${tonesSummary}`);
 
   // Log diagnosi per debug in console
   console.log('📋 Diagnosi pilastri:', {

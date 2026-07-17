@@ -1,27 +1,27 @@
 /**
- * WORKER — il "cuore" che esegue i job accodati dall'API.
+ * WORKER PRISM — esegue i job accodati dall'API.
  *
- * Flusso di un job:
- * 1. L'API crea il job in Redis e lo mette in coda (BullMQ)
- * 2. Questo worker preleva il job dalla coda
- * 3. Esegue F0 (Content Ingest, solo URL) → F1 (Shaper) → F2 (Search) → F3 (Refiner) → F4 (Generation)
- * 4. Alla fine salva tutto su Firestore e cancella da Redis
+ * Due sole azioni supportate:
+ * 1) shaping_only (prepare-shaping) → F0→F1→F2→F3, poi consolidamento. NIENTE F4.
+ * 2) regen_tone   (regenerate-tone-surgical) → genera/rigenera UN solo tono (F4).
  *
- * Miglioramenti produzione in questo file:
- * - Errori temporanei (rete) → riprova automaticamente
- * - Errori definitivi → salva failed su Firestore, NON riprova
- * - Job già completati → skip (evita lavoro doppio)
- * - Ctrl+C / deploy → chiusura pulita senza lasciare connessioni aperte
+ * Flusso analisi:
+ *   API prepare-shaping → Redis + coda → worker F0…F3 → Firestore → DEL Redis
+ *
+ * Flusso tono:
+ *   API regenerate-tone-surgical → coda regen_tone → worker F4 su parentJobId
+ *   → salva testo tono → Firestore → risposta con contenutoGenerato
  */
 
 import dotenv from 'dotenv';
 import { Worker } from 'bullmq';
-// Connessione Redis + funzioni per ping e chiusura pulita
+// Connessione Redis + ping/chiusura pulita
 import redisConnection, { closeRedis, pingRedis } from '../utils/redis.js';
-// AppError = errori con etichetta; isRetryableError = posso riprovare?; logError = log JSON
+// Errori tipizzati + retry policy + log JSON
 import { AppError, isRetryableError, logError } from '../utils/errors.js';
-// Intercetta SIGTERM/SIGINT per chiudere il worker senza troncare i job
+// SIGTERM/SIGINT → chiusura senza troncare il job in corso
 import { registerProcessHandlers } from '../utils/processHandlers.js';
+// Simula errori di fase in test (SIMULATE_FAULT=F1, F2, …)
 import { maybeSimulateFault, logSimulationBanner } from '../utils/simulateFault.js';
 import {
   getRedisJob,
@@ -36,22 +36,29 @@ import {
   hydrateRedisFromFirestore,
   writeGeneratedTone,
   isTerminalJobStatus,
-  TONE_IDS,
   normalizePlatform,
 } from '../services/stateManager.js';
+// F1: diagnosi GAP + toni ON/OFF
 import { runShaperGatekeeper } from '../services/shaper.js';
-// F0: estrazione testo da URL (Tavily Extract) — attivo solo se inputType === 'url'
+// F0: estrazione testo da URL (Tavily Extract)
 import { resolveInput } from '../services/contentIngest.js';
+// F2: ricerche web etichettate
 import { performWebSearch } from '../services/search.js';
+// F3: pilastri SCENARIO / CONTESTO / SFIDE_OPPORTUNITA
 import { refineResults } from '../services/refiner.js';
+// F4: generazione di UN tono (solo path regen_tone)
 import { generateTones } from '../services/generator.js';
+// Verifica companies.enabled_tones
+import { assertToneEnabledForCompany } from '../services/companyAccess.js';
+// BYPASS_DATA_CUTTING da diagnosi Shaper (SCENARIO OK → true)
+import { resolveBypassDataCutting } from '../services/promptLoader.js';
 
 dotenv.config();
 
-const QUEUE_NAME = 'prism-jobs'; // stesso nome usato dall'API quando accoda
-const IS_MOCK = process.env.USE_MOCK_GENERATOR === 'true'; // true = salta chiamate AI reali
+const QUEUE_NAME = 'prism-jobs'; // stesso nome della coda API
+const IS_MOCK = process.env.USE_MOCK_GENERATOR === 'true'; // salta AI esterne in dev
 
-/** Dati finti F0 — testo estratto simulato da un URL (senza chiamata Tavily) */
+/** Dati finti F0 — testo estratto simulato da un URL (senza Tavily) */
 const mockContentIngest = (url) => {
   const sourceUrl = String(url).trim();
   const mockText = [
@@ -120,8 +127,8 @@ const mockRefiner = () => ({
 });
 
 /**
- * Controlla se F0 (estrazione URL) è già stata completata.
- * Per input testo libero F0 non esiste → considerato sempre fatto.
+ * True se F0 è già fatta.
+ * Input testo libero → F0 non esiste → sempre true.
  */
 const isContentIngestDone = (job) => {
   if (job?.inputType !== 'url') return true;
@@ -129,15 +136,15 @@ const isContentIngestDone = (job) => {
 };
 
 /**
- * Controlla se F1 (Shaper) è già stato eseguito.
- * Prima controllavamo solo plan.length: con search_required=false il plan è vuoto
- * ma lo shaping c'è → F1 partiva di nuovo per errore.
+ * True se F1 (Shaper) è già stato eseguito.
+ * Non basta plan.length: con search_required=false il plan è vuoto ma lo shaping c'è.
  */
-const isShapingDone = (shaping) => Boolean(shaping?.updatedAt || shaping?.diagnosi || shaping?.is_blocked);
+const isShapingDone = (shaping) =>
+  Boolean(shaping?.updatedAt || shaping?.diagnosi || shaping?.is_blocked);
 
 /**
- * Se il job è già su Firestore come completed/failed/blocked, non rifare nulla.
- * Può succedere se BullMQ riprova un job già consolidato.
+ * Se il job è già completed/failed/blocked su Firestore, non rifare lavoro.
+ * Succede se BullMQ riprova un job già consolidato.
  */
 const skipIfTerminal = async (targetJobId) => {
   const fsJob = await getFirestoreJob(targetJobId);
@@ -148,297 +155,366 @@ const skipIfTerminal = async (targetJobId) => {
   return false;
 };
 
-// Crea il worker BullMQ: preleva job dalla coda e esegue la funzione sotto
-const worker = new Worker(QUEUE_NAME, async (job) => {
-  // Dati passati dall'API quando ha accodato il job
-  const {
-    userId,
-    companyId,
-    topic,
-    platform,
-    language,
-    maxChars,
-    toneKey,
-    action,
-    parentJobId,
-    instructions,
-  } = job.data;
+/**
+ * Pipeline di analisi F0→F3 (prepare-shaping).
+ * Termina SEMPRE dopo F3: nessun F4 qui.
+ */
+const runAnalysisPipeline = async ({ uid, targetJobId, topic }) => {
+  // --- Carica stato Redis (creato dall'API) ---
+  let state = await getRedisJob(uid, targetJobId);
+  if (!state) {
+    throw new AppError(
+      `Job Redis ${targetJobId} non trovato. Deve essere creato dall'API prepare-shaping.`,
+      { step: 'query_shaping', retryable: true },
+    );
+  }
 
-  const jobId = job.id; // ID del job in coda (può differire da targetJobId in regen_tone)
-  const targetJobId = action === 'regen_tone' ? parentJobId : jobId; // job "vero" da aggiornare
-  const uid = userId;
+  // Status iniziale: ingesting se URL da processare, altrimenti running
+  await patchRedisJob(uid, targetJobId, {
+    status: state.inputType === 'url' && !isContentIngestDone(state) ? 'ingesting' : 'running',
+  });
 
-  console.log(`🚀 [WORKER][${targetJobId}] Azione: ${action || 'standard'} (attempt ${job.attemptsMade + 1}/${job.opts.attempts ?? 1})`);
-
-  // Job già chiuso? Esci subito.
-  if (await skipIfTerminal(targetJobId)) return;
-
-  let state = null; // stato job letto da Redis, aggiornato ad ogni fase
-
-  try {
-    // -------------------------------------------------------------------------
-    // RIGENERAZIONE SINGOLO TONO (post-consolidamento Firestore)
-    // -------------------------------------------------------------------------
-    if (action === 'regen_tone' && toneKey) {
-      state = await getRedisJob(uid, targetJobId);
-      if (!state) state = await hydrateRedisFromFirestore(uid, targetJobId);
-      if (!state) throw new AppError(`Job ${targetJobId} non trovato.`, { step: 'generation', retryable: false });
-
-      const tone = state.tones?.[toneKey];
-      if (!tone || tone.status !== 'ON') {
-        throw new AppError(`Tono ${toneKey} non idoneo (status OFF o assente).`, { step: 'generation', retryable: false });
-      }
-
-      await patchRedisJob(uid, targetJobId, {
-        status: 'generating',
-        workerState: { currentStep: 'generation', progress: 0.5, updatedAt: new Date().toISOString() },
-      });
-
-      const refiner = state.refiner;
-      const output = await generateTones(
-        {
-          topic: state.topic,
-          platform: normalizePlatform(platform || state.platform),
-          language: language || state.language,
-          maxChars,
-          singleToneTarget: toneKey,
-          instructions: instructions || '',
-        },
-        refiner.compressedFacts || [],
-        refiner.sourcesPreview || [],
-        refiner.tables || []
-      );
-
-      const newText = output[toneKey]?.text;
-      if (!newText) {
-        throw new AppError(`Generazione fallita per tono: ${toneKey}`, { step: 'generation', retryable: true });
-      }
-
-      await writeGeneratedTone(uid, targetJobId, toneKey, newText, { instructions });
-      await patchRedisJob(uid, targetJobId, {
-        status: 'completed',
-        workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
-      });
-
-      await consolidateToFirestore(uid, targetJobId, 'completed');
-      console.log(`[WORKER][${targetJobId}] Rigenerazione tono ${toneKey} consolidata.`);
-      return;
-    }
-
-    // -------------------------------------------------------------------------
-    // INIZIALIZZAZIONE REDIS
-    // -------------------------------------------------------------------------
-    state = await getRedisJob(uid, targetJobId);
-    if (!state) {
-      throw new AppError(
-        `Job Redis ${targetJobId} non trovato. Deve essere creato dall'API.`,
-        { step: 'query_shaping', retryable: true }
-      );
-    }
+  // -------------------------------------------------------------------------
+  // F0 — CONTENT INGEST (solo se l'input è un URL)
+  // -------------------------------------------------------------------------
+  if (!isContentIngestDone(state)) {
+    console.log(`📄 [WORKER][${targetJobId}] F0 Content Ingest (URL)...`);
+    maybeSimulateFault('content_ingest');
 
     await patchRedisJob(uid, targetJobId, {
-      status: state.inputType === 'url' && !isContentIngestDone(state) ? 'ingesting' : 'running',
+      status: 'ingesting',
+      workerState: {
+        currentStep: 'content_ingest',
+        progress: 0.05,
+        updatedAt: new Date().toISOString(),
+      },
     });
 
-    // -------------------------------------------------------------------------
-    // F0 — CONTENT INGEST (solo se l'utente ha inserito un URL)
-    // -------------------------------------------------------------------------
-    if (!isContentIngestDone(state)) {
-      console.log(`📄 [WORKER][${targetJobId}] F0 Content Ingest (URL)...`);
-      maybeSimulateFault('content_ingest');
+    const sourceUrl = state.originalInput || topic;
+    const ingestOut = IS_MOCK
+      ? mockContentIngest(sourceUrl)
+      : await resolveInput(sourceUrl);
 
+    state = await writeContentIngestToRedis(uid, targetJobId, ingestOut);
+    console.log(
+      `✅ [WORKER][${targetJobId}] F0 completata (${ingestOut.sourceMeta?.charCount || 0} caratteri).`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // F1 — SHAPER & GATEKEEPER (diagnosi GAP + toni ON/OFF)
+  // -------------------------------------------------------------------------
+  if (!isShapingDone(state.shaping)) {
+    console.log(`🧠 [WORKER][${targetJobId}] F1 Shaper...`);
+    maybeSimulateFault('query_shaping');
+
+    const shaperTopic = state.topic || topic;
+    const shaperOut = IS_MOCK
+      ? mockShaper(shaperTopic)
+      : await runShaperGatekeeper(shaperTopic);
+    state = await writeShapingToRedis(uid, targetJobId, shaperOut);
+
+    // Input non ammesso → blocked e stop (niente F2/F3)
+    if (shaperOut.is_blocked) {
       await patchRedisJob(uid, targetJobId, {
-        status: 'ingesting',
-        workerState: {
-          currentStep: 'content_ingest',
-          progress: 0.05,
-          updatedAt: new Date().toISOString(),
-        },
+        status: 'blocked',
+        error: { message: shaperOut.block_message, step: 'query_shaping' },
+      });
+      await consolidateToFirestore(uid, targetJobId, 'blocked');
+      console.log(`[WORKER][${targetJobId}] Input bloccato dal Gatekeeper.`);
+      return;
+    }
+  }
+
+  state = await getRedisJob(uid, targetJobId);
+  // false = tutti i pilastri OK → salta le ricerche web
+  const searchRequired = state.shaping?.search_required !== false;
+  const plan = state.shaping?.plan || [];
+
+  // -------------------------------------------------------------------------
+  // F2 — TAVILY SEARCH (solo se serve)
+  // -------------------------------------------------------------------------
+  if (searchRequired && !state.tavily?.rawResults?.length) {
+    console.log(`🌐 [WORKER][${targetJobId}] F2 Search...`);
+    maybeSimulateFault('tavily_search');
+
+    const { rawResults } = IS_MOCK ? mockTavily() : await performWebSearch(plan);
+    state = await writeTavilyToRedis(uid, targetJobId, rawResults);
+  } else if (!searchRequired) {
+    console.log(`⏭️ [WORKER][${targetJobId}] F2 saltata (search_required=false).`);
+    await patchRedisJob(uid, targetJobId, {
+      tavily: { rawResults: [] },
+      workerState: {
+        currentStep: 'tavily_search',
+        progress: 0.5,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // F3 — REFINER (3 pilastri editoriali)
+  // -------------------------------------------------------------------------
+  state = await getRedisJob(uid, targetJobId);
+  if (!state.refiner?.compressedFacts?.length) {
+    console.log(`💎 [WORKER][${targetJobId}] F3 Refiner...`);
+    maybeSimulateFault('refiner');
+
+    const refinerOut = IS_MOCK
+      ? mockRefiner()
+      : await refineResults(state.topic || topic, {
+        diagnosi: state.shaping?.diagnosi,
+        rawResults: state.tavily?.rawResults || [],
+        searchRequired,
       });
 
-      const sourceUrl = state.originalInput || topic;
-      const ingestOut = IS_MOCK
-        ? mockContentIngest(sourceUrl)
-        : await resolveInput(sourceUrl);
+    state = await writeRefinerToRedis(uid, targetJobId, refinerOut);
+  }
 
-      state = await writeContentIngestToRedis(uid, targetJobId, ingestOut);
-      console.log(`✅ [WORKER][${targetJobId}] F0 completata (${ingestOut.sourceMeta?.charCount || 0} caratteri estratti).`);
-    }
+  // -------------------------------------------------------------------------
+  // FINE ANALISI — nessun F4: i testi tono arrivano solo da regen_tone
+  // -------------------------------------------------------------------------
+  await patchRedisJob(uid, targetJobId, {
+    status: 'completed',
+    workerState: {
+      currentStep: 'done',
+      progress: 1.0,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  await consolidateToFirestore(uid, targetJobId, 'completed');
+  console.log(
+    `[WORKER][${targetJobId}] Analisi F0→F3 completata. Consolidato su Firestore (niente F4).`,
+  );
+};
 
-    // -------------------------------------------------------------------------
-    // F1 — SHAPER & GATEKEEPER
-    // -------------------------------------------------------------------------
-    if (!isShapingDone(state.shaping)) {
-      console.log(`🧠 [WORKER][${targetJobId}] F1 Shaper...`);
-      maybeSimulateFault('query_shaping');
+/**
+ * Generazione / rigenerazione di UN solo tono (regenerate-tone-surgical).
+ * Usa i pilastri già prodotti da prepare-shaping.
+ */
+const runToneGeneration = async ({
+  uid,
+  targetJobId,
+  companyId,
+  toneKey,
+  topic,
+  platform,
+  language,
+  maxChars,
+  instructions,
+  previousContent,
+}) => {
+  // Company abilitata a questo tono?
+  await assertToneEnabledForCompany(companyId, toneKey);
 
-      const shaperTopic = state.topic || topic;
-      const shaperOut = IS_MOCK ? mockShaper(shaperTopic) : await runShaperGatekeeper(shaperTopic);
-      state = await writeShapingToRedis(uid, targetJobId, shaperOut);
+  // Job padre: Redis oppure idratazione da Firestore
+  let state = await getRedisJob(uid, targetJobId);
+  if (!state) state = await hydrateRedisFromFirestore(uid, targetJobId);
+  if (!state) {
+    throw new AppError(`Job ${targetJobId} non trovato.`, {
+      step: 'generation',
+      retryable: false,
+    });
+  }
 
-      if (shaperOut.is_blocked) {
-        await patchRedisJob(uid, targetJobId, {
-          status: 'blocked',
-          error: { message: shaperOut.block_message, step: 'query_shaping' },
+  // Tono deve esistere ed essere ON (decisione Shaper + gatekeeper)
+  const tone = state.tones?.[toneKey];
+  if (!tone || tone.status !== 'ON') {
+    throw new AppError(`Tono ${toneKey} non idoneo (status OFF o assente).`, {
+      step: 'generation',
+      retryable: false,
+    });
+  }
+
+  await patchRedisJob(uid, targetJobId, {
+    status: 'generating',
+    workerState: {
+      currentStep: 'generation',
+      progress: 0.5,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+
+  const refiner = state.refiner || {};
+  // TRUE se Shaper ha messo SCENARIO=OK
+  const bypassDataCutting = resolveBypassDataCutting(state.shaping);
+  // Baseline strutturale: request o testo già presente
+  const prevContent =
+    String(previousContent || '').trim() || String(tone.text || '').trim();
+
+  // Una sola chiamata Gemini per questo tono
+  const output = await generateTones(
+    {
+      topic: topic || state.topic,
+      platform: normalizePlatform(platform || state.platform),
+      language: language || state.language,
+      maxChars,
+      toneKey,
+      instructions: instructions || '',
+      previousContent: prevContent,
+      bypassDataCutting,
+      shaping: state.shaping,
+    },
+    refiner.compressedFacts || [],
+  );
+
+  const newText = output?.text;
+  if (!newText) {
+    throw new AppError(`Generazione fallita per tono: ${toneKey}`, {
+      step: 'generation',
+      retryable: true,
+    });
+  }
+
+  // Salva testo + bump versione sul job padre
+  await writeGeneratedTone(uid, targetJobId, toneKey, newText, { instructions });
+  await patchRedisJob(uid, targetJobId, {
+    status: 'completed',
+    workerState: {
+      currentStep: 'done',
+      progress: 1.0,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  await consolidateToFirestore(uid, targetJobId, 'completed');
+  console.log(`[WORKER][${targetJobId}] Tono ${toneKey} generato e consolidato.`);
+
+  // Valore letto da waitUntilFinished nell'API
+  return { text: newText, contenutoGenerato: newText, toneKey };
+};
+
+// Worker BullMQ: un job alla volta (concurrency: 1)
+const worker = new Worker(
+  QUEUE_NAME,
+  async (job) => {
+    // Payload messo in coda dall'API
+    const {
+      userId,
+      companyId,
+      topic,
+      platform,
+      language,
+      maxChars,
+      toneKey,
+      action,
+      parentJobId,
+      instructions,
+      previousContent,
+    } = job.data;
+
+    const jobId = job.id;
+    // regen_tone aggiorna il job di analisi (parent); shaping_only usa il proprio id
+    const targetJobId = action === 'regen_tone' ? parentJobId : jobId;
+    const uid = userId;
+
+    console.log(
+      `🚀 [WORKER][${targetJobId}] Azione: ${action} (attempt ${job.attemptsMade + 1}/${job.opts.attempts ?? 1})`,
+    );
+
+    // Già chiuso su Firestore → esci
+    if (await skipIfTerminal(targetJobId)) return;
+
+    let state = null;
+
+    try {
+      // --- Solo generazione tono ---
+      if (action === 'regen_tone') {
+        if (!toneKey) {
+          throw new AppError('toneKey obbligatorio per regen_tone.', {
+            step: 'generation',
+            retryable: false,
+          });
+        }
+        return await runToneGeneration({
+          uid,
+          targetJobId,
+          companyId,
+          toneKey,
+          topic,
+          platform,
+          language,
+          maxChars,
+          instructions,
+          previousContent,
         });
-        await consolidateToFirestore(uid, targetJobId, 'blocked');
-        console.log(`[WORKER][${targetJobId}] Input bloccato dal Gatekeeper.`);
+      }
+
+      // --- Solo analisi F0→F3 (prepare-shaping) ---
+      if (action === 'shaping_only') {
+        await runAnalysisPipeline({ uid, targetJobId, topic });
         return;
       }
-    }
 
-    state = await getRedisJob(uid, targetJobId);
-    const searchRequired = state.shaping?.search_required !== false; // false = salta F2
-    const plan = state.shaping?.plan || []; // query Tavily create in F1
-
-    // -------------------------------------------------------------------------
-    // F2 — TAVILY (condizionale)
-    // -------------------------------------------------------------------------
-    if (searchRequired && !state.tavily?.rawResults?.length) {
-      console.log(`🌐 [WORKER][${targetJobId}] F2 Search...`);
-      maybeSimulateFault('tavily_search'); // test errore F2 se SIMULATE_FAULT=F2
-
-      const { rawResults } = IS_MOCK ? mockTavily() : await performWebSearch(plan);
-      state = await writeTavilyToRedis(uid, targetJobId, rawResults);
-    } else if (!searchRequired) {
-      console.log(`⏭️ [WORKER][${targetJobId}] F2 saltata (search_required=false).`);
-      await patchRedisJob(uid, targetJobId, {
-        tavily: { rawResults: [] },
-        workerState: { currentStep: 'tavily_search', progress: 0.5, updatedAt: new Date().toISOString() },
-      });
-    }
-
-    // -------------------------------------------------------------------------
-    // F3 — REFINER
-    // -------------------------------------------------------------------------
-    state = await getRedisJob(uid, targetJobId);
-    if (!state.refiner?.compressedFacts?.length) {
-      console.log(`💎 [WORKER][${targetJobId}] F3 Refiner...`);
-      maybeSimulateFault('refiner'); // test errore F3 se SIMULATE_FAULT=F3
-
-      const refinerOut = IS_MOCK
-        ? mockRefiner()
-        : await refineResults(state.topic || topic, {
-          diagnosi: state.shaping?.diagnosi,
-          rawResults: state.tavily?.rawResults || [],
-          searchRequired,
-        });
-
-      state = await writeRefinerToRedis(uid, targetJobId, refinerOut);
-    }
-
-    // -------------------------------------------------------------------------
-    // STOP — shaping_only → consolidamento Firestore + DEL Redis
-    // -------------------------------------------------------------------------
-    if (action === 'shaping_only') {
-      await patchRedisJob(uid, targetJobId, {
-        status: 'completed',
-        workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
-      });
-      await consolidateToFirestore(uid, targetJobId, 'completed');
-      console.log(`[WORKER][${targetJobId}] Analisi completata. Record portato su Firestore e rimosso da Redis.`);
-      return;
-    }
-
-    // -------------------------------------------------------------------------
-    // F4 — GENERATION (tutti i toni ON)
-    // -------------------------------------------------------------------------
-    state = await getRedisJob(uid, targetJobId);
-    // Solo toni con status ON (decisi dallo Shaper in F1)
-    const tonesOn = TONE_IDS.filter((id) => state.tones?.[id]?.status === 'ON');
-    // Genera solo i toni ON che non hanno ancora testo
-    const needsGeneration = tonesOn.some((id) => !state.tones[id]?.text?.trim());
-
-    if (needsGeneration) {
-      console.log(`🎨 [WORKER][${targetJobId}] F4 Generation (${tonesOn.length} toni ON)...`);
-      maybeSimulateFault('generation'); // test errore F4 se SIMULATE_FAULT=F4
-
-      await patchRedisJob(uid, targetJobId, {
-        status: 'generating',
-        workerState: { currentStep: 'generation', progress: 0.9, updatedAt: new Date().toISOString() },
-      });
-
-      const generated = await generateTones(
-        {
-          topic: state.topic,
-          platform: state.platform,
-          language: state.language,
-          maxChars,
-          allowedTones: tonesOn,
-        },
-        state.refiner.compressedFacts || [],
-        state.refiner.sourcesPreview || [],
-        state.refiner.tables || []
+      // Qualsiasi altra action non è più supportata
+      throw new AppError(
+        `Azione non supportata: ${action || '(vuota)'}. Usa shaping_only o regen_tone.`,
+        { step: 'unknown', retryable: false },
       );
+    } catch (err) {
+      const step = err?.step || state?.workerState?.currentStep || 'unknown';
+      logError(`WORKER:${targetJobId}`, err, {
+        step,
+        attempt: job.attemptsMade + 1,
+      });
 
-      const tones = { ...state.tones };
-      for (const id of tonesOn) {
-        if (generated[id]?.text) {
-          tones[id] = {
-            ...tones[id],
-            text: generated[id].text,
-            version: 1,
-            type: 'generation',
-          };
-        }
-      }
-
-      // Se manca anche un solo tono ON, il job non è completo → errore (così riprova o fallisce chiaramente)
-      const missingTones = tonesOn.filter((id) => !tones[id]?.text?.trim());
-      if (missingTones.length) {
-        throw new AppError(
-          `Generazione incompleta per toni: ${missingTones.join(', ')}`,
-          { step: 'generation', retryable: true }
-        );
-      }
-
-      await patchRedisJob(uid, targetJobId, { tones });
-    }
-
-    await patchRedisJob(uid, targetJobId, {
-      status: 'completed',
-      workerState: { currentStep: 'done', progress: 1.0, updatedAt: new Date().toISOString() },
-    });
-
-    await consolidateToFirestore(uid, targetJobId, 'completed');
-    console.log(`[WORKER][${targetJobId}] Pipeline completata. Consolidato su Firestore.`);
-
-  } catch (err) {
-    const step = err?.step || state?.workerState?.currentStep || 'unknown';
-    logError(`WORKER:${targetJobId}`, err, { step, attempt: job.attemptsMade + 1 });
-
-    const maxAttempts = job.opts?.attempts ?? 1;
-    // Posso riprovare SOLO se l'errore è temporaneo E ho ancora tentativi BullMQ disponibili
-    const canRetry = isRetryableError(err) && job.attemptsMade < maxAttempts - 1;
-
-    if (canRetry) {
-      // Salva in Redis che stiamo riprovando (utile per il frontend che fa polling)
-      try {
-        if (state) {
+      // Regen fallita: non marcare il job padre come failed (resta completed)
+      if (action === 'regen_tone') {
+        try {
           await patchRedisJob(uid, targetJobId, {
+            status: 'completed',
             workerState: {
-              retryCount: job.attemptsMade + 1,
+              currentStep: 'done',
+              progress: 1.0,
               lastError: err.message,
-              currentStep: step,
               updatedAt: new Date().toISOString(),
             },
           });
+        } catch (patchErr) {
+          logError(`WORKER:${targetJobId}:regenRestore`, patchErr);
         }
-      } catch (patchErr) {
-        logError(`WORKER:${targetJobId}:retryPatch`, patchErr);
+        // Rilancia → BullMQ failed → API waitUntilFinished riceve l'errore
+        throw err;
       }
-      throw err; // BullMQ riaccoderà il job per un nuovo tentativo
+
+      const maxAttempts = job.opts?.attempts ?? 1;
+      const canRetry =
+        isRetryableError(err) && job.attemptsMade < maxAttempts - 1;
+
+      if (canRetry) {
+        // Aggiorna Redis per il polling UI (stiamo riprovando)
+        try {
+          const current = await getRedisJob(uid, targetJobId);
+          if (current) {
+            await patchRedisJob(uid, targetJobId, {
+              workerState: {
+                retryCount: job.attemptsMade + 1,
+                lastError: err.message,
+                currentStep: step,
+                updatedAt: new Date().toISOString(),
+              },
+            });
+          }
+        } catch (patchErr) {
+          logError(`WORKER:${targetJobId}:retryPatch`, patchErr);
+        }
+        throw err; // BullMQ ritenta
+      }
+
+      // Errore definitivo sull'analisi → failed su Firestore
+      const { persisted } = await failAndConsolidate(
+        uid,
+        targetJobId,
+        err.message,
+        step,
+        'failed',
+      );
+      if (!persisted) throw err;
     }
+  },
+  { connection: redisConnection, concurrency: 1 },
+);
 
-    // Errore definitivo O tentativi esauriti → salva failed su Firestore
-    const { persisted } = await failAndConsolidate(uid, targetJobId, err.message, step, 'failed');
-    // Se failAndConsolidate ha funzionato, NON rilanciare: il job è chiuso correttamente
-    // Se non ha funzionato (persisted=false), rilancia così BullMQ lo segnala come failed
-    if (!persisted) throw err;
-  }
-}, { connection: redisConnection, concurrency: 1 }); // concurrency:1 = un job alla volta
-
-// Eventi della coda BullMQ — utili per capire cosa succede in produzione
+// Log eventi coda (produzione)
 worker.on('failed', (job, err) => {
   logError('WORKER:queue:failed', err, {
     jobId: job?.id,
@@ -451,25 +527,25 @@ worker.on('error', (err) => {
   logError('WORKER:queue:error', err);
 });
 
-// "stalled" = job bloccato troppo a lungo (worker crashato a metà?)
 worker.on('stalled', (jobId) => {
   console.warn(`⚠️ [WORKER] Job stalled: ${jobId}`);
 });
 
-// Registra chiusura pulita: Ctrl+C o deploy chiama worker.close() poi redis.quit()
+// Chiusura pulita su deploy / Ctrl+C
 registerProcessHandlers({
   label: 'worker',
   onShutdown: async () => {
-    await worker.close(); // aspetta che il job in corso finisca
+    await worker.close();
     await closeRedis();
   },
 });
 
-// All'avvio verifica che Redis risponda (se no, log warning ma il worker resta in ascolto)
 logSimulationBanner();
 
 pingRedis()
-  .then(() => console.log('🚀 Worker PRISM operativo (Redis online → Firestore consolidato).'))
+  .then(() =>
+    console.log('🚀 Worker PRISM operativo (shaping_only F0→F3 | regen_tone F4).'),
+  )
   .catch((err) => {
     logError('worker:startup', err);
     console.warn('⚠️ Worker avviato ma Redis non raggiungibile — in attesa di riconnessione.');

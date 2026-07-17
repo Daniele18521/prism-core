@@ -95,26 +95,52 @@ describe('Shaper — normalizeShaperOutput', () => {
     assert.equal(out.plan[0].pillar, 'scenario');
   });
 
-  test('normalizza tutti e 6 i toni', () => {
-    const out = normalizeShaperOutput({
-      is_blocked: false,
-      block_message: '',
-      diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
-      search_required: false,
-      tone_suitability: {
-        provocatore: { status: 'OFFMotivo provocatore' },
-        confidente: { status: 'ON' },
-        sferzante: { status: 'OFF', lock_reason: 'ironia' },
-        visionario: { status: 'ON' },
-        metodologico: { status: 'ON' },
-        narratore: { status: 'ON' },
+  test('normalizza toni e gatekeeper forza ON su topic neutro', () => {
+    const out = normalizeShaperOutput(
+      {
+        is_blocked: false,
+        block_message: '',
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+        search_required: false,
+        tone_suitability: {
+          provocatore: { status: 'OFFMotivo provocatore' },
+          confidente: { status: 'ON' },
+          sferzante: { status: 'OFF', lock_reason: 'ironia' },
+          visionario: { status: 'ON' },
+          metodologico: { status: 'ON' },
+          narratore: { status: 'ON' },
+        },
+        plan: [],
       },
-      plan: [],
-    });
-    assert.equal(out.tone_suitability.provocatore.status, 'OFF');
-    assert.equal(out.tone_suitability.provocatore.lock_reason, 'Motivo provocatore');
+      'Trend marketing digitale 2026',
+    );
+    // Gemini aveva messo OFF, ma senza segnali solenni/umanitari → ON
+    assert.equal(out.tone_suitability.provocatore.status, 'ON');
+    assert.equal(out.tone_suitability.sferzante.status, 'ON');
     assert.equal(out.tone_suitability.confidente.status, 'ON');
-    assert.equal(out.tone_suitability.sferzante.lock_reason, 'ironia');
+  });
+
+  test('topic politico: provocatore e sferzante ON anche se Gemini spegne', () => {
+    const out = normalizeShaperOutput(
+      {
+        is_blocked: false,
+        block_message: '',
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+        search_required: false,
+        tone_suitability: {
+          provocatore: { status: 'OFF', lock_reason: 'Richiesto rispetto solenne' },
+          confidente: { status: 'ON', lock_reason: '' },
+          sferzante: { status: 'OFF', lock_reason: "Incompatibile con l'ironia" },
+          visionario: { status: 'ON', lock_reason: '' },
+          metodologico: { status: 'ON', lock_reason: '' },
+          narratore: { status: 'ON', lock_reason: '' },
+        },
+        plan: [],
+      },
+      'Crisi di governo Meloni: Camera respinge emendamento, opposizioni chiedono dimissioni',
+    );
+    assert.equal(out.tone_suitability.provocatore.status, 'ON');
+    assert.equal(out.tone_suitability.sferzante.status, 'ON');
   });
 });
 

@@ -1,167 +1,257 @@
 /**
- * GENERATOR (F4) — genera i testi finali per ogni tono editoriale.
+ * GENERATOR (F4) — genera il testo di UN singolo tono editoriale.
  *
- * Input: i 3 blocchi del Refiner (SCENARIO, CONTESTO, SFIDE_OPPORTUNITA)
- * Output: un testo per ogni tono ON (provocatore, narratore, ecc.)
+ * Nel flusso PRISM:
+ * F0 URL → F1 Shaper → F2 Search → F3 Refiner → F4 questo file.
  *
- * Legge da Redis le "regole" di scrittura (prompt template per tono, piattaforma, profilo).
- * Per ogni tono chiama Gemini e estrae il testo tra <<<START_TONE>>> e <<<END_TONE>>>.
+ * Recupera da Firestore (schema Prompt) e li usa così:
+ * 1. System Instructions (Prompt/config.system_instructions) → Gemini systemInstruction
+ * 2. Tono (Prompt/config/Toni/{tono}) → parte del prompt utente
+ * 3. Piattaforma (Prompt/config/Piattaforma/{piattaforma}) → parte del prompt utente
+ * Poi aggiunge variabili di input + i 3 pilastri (SCENARIO/CONTESTO/SFIDE).
+ *
+ * Genera SOLO il tono passato in input (nessun ciclo su più toni).
+ * Output: testo tra <<<START_TONE>>> e <<<END_TONE>>>.
  */
 
 import dotenv from 'dotenv';
-import redis from '../utils/redis.js';
-import { TONE_IDS } from './stateManager.js';
+// Carica prompt da Firestore + helper variabili
+import {
+  loadComposedPromptFromFirestore,
+  applyPromptPlaceholders,
+  buildInputVariablesBlock,
+  resolveBypassDataCutting,
+  platformToDocId,
+} from './promptLoader.js';
+// Lista toni validi + normalizza piattaforma
+import { TONE_IDS, normalizePlatform } from './stateManager.js';
+import { AppError } from '../utils/errors.js';
 
 dotenv.config();
 
-// Se true, non chiama Gemini ma restituisce testo finto (utile per sviluppo senza spendere API)
+// Se true, non chiama Gemini: restituisce testo finto (sviluppo senza spendere API)
 const USE_MOCK = process.env.USE_MOCK_GENERATOR === 'true';
 
 /**
- * Genera i testi per uno o più toni editoriali.
- *
- * @param input - topic, platform, language, allowedTones, singleToneTarget (rigenerazione), instructions
- * @param compressedFacts - blocchi SCENARIO/CONTESTO/SFIDE dal Refiner
- * @param sourcesPreview - elenco fonti web per citazioni
- * @param tables - tabelle estratte (se presenti)
+ * Estrae il testo tra i delimitatori START/END dalla risposta grezza di Gemini.
+ * @param {string} rawText
+ * @returns {string}
  */
-export const generateTones = async (input, compressedFacts = [], sourcesPreview = [], tables = []) => {
-  const targetPlatform = (input.platform || 'general').toLowerCase();
-  const userProfile = (input.profile || 'basic').toLowerCase();
+const extractToneText = (rawText) => {
+  const startTag = '<<<START_TONE>>>';
+  const endTag = '<<<END_TONE>>>';
+  const startIndex = rawText.indexOf(startTag);
+  const endIndex = rawText.indexOf(endTag);
+  if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
+    return rawText.substring(startIndex + startTag.length, endIndex).trim();
+  }
+  return String(rawText || '').trim();
+};
 
-  console.log(`🎨 F4: Esecuzione ${USE_MOCK ? '[MOCK]' : '[LIVE]'} | Profilo [${userProfile.toUpperCase()}] | [${targetPlatform.toUpperCase()}]`);
+/**
+ * Formatta i compressedFacts del Refiner come i 3 pilastri editoriali.
+ * @param {string[]} compressedFacts
+ * @returns {string}
+ */
+const formatPillarsBlock = (compressedFacts = []) => {
+  const labels = ['SCENARIO', 'CONTESTO', 'SFIDE_OPPORTUNITA'];
+  const byPillar = Object.fromEntries(labels.map((l) => [l, '']));
+
+  for (const line of compressedFacts) {
+    const m = String(line ?? '').match(/^([A-Z_]+):\s*(.+)$/s);
+    if (!m) continue;
+    const [, prefix, body] = m;
+    if (byPillar[prefix] !== undefined) {
+      byPillar[prefix] = body.trim();
+    }
+  }
+
+  if (labels.every((l) => !byPillar[l]) && compressedFacts.length > 0) {
+    compressedFacts.slice(0, 3).forEach((line, i) => {
+      byPillar[labels[i]] = String(line ?? '').trim();
+    });
+  }
+
+  return labels
+    .map((label) => `${label}:\n${byPillar[label] || '(non disponibile)'}`)
+    .join('\n\n');
+};
+
+/**
+ * Risolve il tono da generare dall'input (un solo tono obbligatorio).
+ * Accetta: toneKey | tono | singleToneTarget
+ * @param {object} input
+ * @returns {string}
+ */
+const resolveToneKey = (input = {}) => {
+  const raw = input.toneKey || input.tono || input.singleToneTarget || '';
+  const tone = String(raw).trim().toLowerCase();
+  if (!tone || !TONE_IDS.includes(tone)) {
+    throw new AppError(`Tono non valido o mancante: ${raw || '(vuoto)'}`, {
+      code: 'TONE_UNKNOWN',
+      retryable: false,
+      step: 'generation',
+    });
+  }
+  return tone;
+};
+
+/**
+ * Assembla systemInstruction + prompt utente per UN tono.
+ * @returns {Promise<{ systemInstruction: string, userPrompt: string }>}
+ */
+export const buildToneGenerationPrompt = async ({
+  toneKey,
+  platform,
+  language,
+  topic,
+  instructions = '',
+  previousContent = '',
+  bypassDataCutting = false,
+  compressedFacts = [],
+}) => {
+  const platformLabel = normalizePlatform(platform);
+  const { system, userParts } = await loadComposedPromptFromFirestore({
+    toneKey,
+    platform: platformLabel,
+  });
+
+  const vars = {
+    LINGUA_OUTPUT: language || 'italiano',
+    PIATTAFORMA: platformLabel,
+    TONO: toneKey,
+    BYPASS_DATA_CUTTING: bypassDataCutting ? 'TRUE' : 'FALSE',
+    ISTRUZIONI_AGGIUNTIVE: instructions || '',
+    CONTENUTO_PRECEDENTE: previousContent || '',
+    ARGOMENTO: topic || '',
+  };
+
+  const systemInstruction = applyPromptPlaceholders(system, {
+    ...vars,
+    BYPASS_DATA_CUTTING: vars.BYPASS_DATA_CUTTING,
+  });
+
+  const userTemplates = applyPromptPlaceholders(userParts, {
+    ...vars,
+    BYPASS_DATA_CUTTING: vars.BYPASS_DATA_CUTTING,
+  });
+
+  const pillarsBlock = formatPillarsBlock(compressedFacts);
+
+  const userPrompt = `
+${userTemplates}
+
+${buildInputVariablesBlock({
+  ...vars,
+  BYPASS_DATA_CUTTING: bypassDataCutting,
+})}
+
+[[ PILASTRI EDITORIALI (REFINER) ]]
+${pillarsBlock}
+
+⚠️ REQUISITO DI CONTENIMENTO TASSATIVO (HARD CONSTRAINT):
+NON rispondere in formato JSON o XML.
+VIETATO racchiudere i marcatori strutturali all'interno di blocchi di codice Markdown (NON usare i tripli backtick \`\`\`).
+Stampa il testo libero del post direttamente ed esclusivamente all'interno dei delimitatori esatti:
+
+<<<START_TONE>>>
+(Inserisci qui l'intero contenuto del post completo, non interromperlo mai a metà)
+<<<END_TONE>>>
+
+GENERA L'OUTPUT RISPETTANDO I DELIMITATORI <<< >>>. NON AGGIUNGERE ALTRO PRIMA O DOPO I DELIMITATORI.
+`.trim();
+
+  return { systemInstruction, userPrompt };
+};
+
+/**
+ * Genera il testo di UN solo tono (quello passato in input).
+ *
+ * BYPASS_DATA_CUTTING:
+ * - se input.bypassDataCutting è boolean → usa quello
+ * - altrimenti SCENARIO OK → TRUE, GAP → FALSE
+ *
+ * @param {object} input — toneKey/tono obbligatorio, platform, language, topic,
+ *   instructions, previousContent, bypassDataCutting, shaping
+ * @param {string[]} compressedFacts — blocchi SCENARIO/CONTESTO/SFIDE dal Refiner
+ * @returns {Promise<{ text: string, authority: string, toneKey: string }>}
+ */
+export const generateTones = async (input, compressedFacts = []) => {
+  const toneKey = resolveToneKey(input);
+  const targetPlatform = normalizePlatform(input.platform || 'general');
+
+  const bypassDataCutting =
+    typeof input.bypassDataCutting === 'boolean'
+      ? input.bypassDataCutting
+      : resolveBypassDataCutting(input.shaping);
+
+  console.log(
+    `🎨 F4: Generazione tono [${toneKey}] | Piattaforma [${targetPlatform}] | bypass=${bypassDataCutting} | ${USE_MOCK ? 'MOCK' : 'LIVE'}`,
+  );
 
   const API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : null;
   if (!USE_MOCK && !API_KEY) {
-    console.error('❌ [CRITICO] GEMINI_API_KEY non configurata!');
-    throw new Error('Mancano le credenziali API.');
+    throw new AppError('Mancano le credenziali API (GEMINI_API_KEY).', {
+      code: 'GEMINI_KEY_MISSING',
+      retryable: false,
+      step: 'generation',
+    });
   }
 
   const URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${API_KEY}`;
 
-  // Prepara il contesto che Gemini userà per scrivere ogni tono
-  const fontiTestuali = sourcesPreview.length > 0
-    ? sourcesPreview.map((s) => `FONTE: ${s.title} [URL: ${s.url}]`).join('\n')
-    : 'NULL';
-  const fattiComprimibili = compressedFacts.length > 0
-    ? compressedFacts.map((f, i) => `${i + 1}. ${f}`).join('\n')
-    : 'Nessun dato strutturato disponibile.';
-  const tabelleCtx = tables.length > 0 ? JSON.stringify(tables) : 'Nessuna tabella.';
-
-  // Istruzioni extra dell'utente in caso di rigenerazione chirurgica di un tono
-  const instructionsBlock = input.instructions?.trim()
-    ? `\n[[ ISTRUZIONI DI RIGENERAZIONE ]]\n${input.instructions.trim()}\n`
-    : '';
-
-  const finalTones = {};
-  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
   try {
-    // Carica in parallelo da Redis tutte le regole di prompt (velocizza l'avvio)
-    const [profileAllowedTonesRaw, coreRules, epistemeRules, platformRules] = await Promise.all([
-      redis.hget('prism:config:profiles', userProfile), // quali toni può usare questo profilo
-      redis.get('prism:config:core'), // regole base PRISM
-      redis.get('prism:config:episteme'), // regole epistemologiche (come usare le fonti)
-      redis.hget('prism:config:platforms', targetPlatform), // regole LinkedIn, X, ecc.
-    ]);
+    const { systemInstruction, userPrompt } = await buildToneGenerationPrompt({
+      toneKey,
+      platform: targetPlatform,
+      language: input.language || 'italiano',
+      topic: input.topic || '',
+      instructions: input.instructions || '',
+      previousContent: input.previousContent || '',
+      bypassDataCutting,
+      compressedFacts,
+    });
 
-    if (!coreRules || !platformRules || !profileAllowedTonesRaw) {
-      throw new Error('Configurazione incompleta su Redis.');
+    console.log(
+      `\n--- SYSTEM INSTRUCTION (${toneKey}) ---\n${systemInstruction.slice(0, 400)}...\n` +
+      `--- USER PROMPT (${platformToDocId(targetPlatform)}) ---\n${userPrompt.slice(0, 600)}...\n------------------------------------------\n`,
+    );
+
+    if (USE_MOCK) {
+      console.log(`🧪 [MOCK] Simulazione completata per ${toneKey}`);
+      return {
+        text: `Contenuto mock per ${toneKey} su: ${input.topic || 'n/d'}`,
+        authority: 'MOCK-GENERATED',
+        toneKey,
+      };
     }
 
-    // Lista toni da generare: quelli passati dal worker O quelli del profilo utente
-    let allowedTones = input.allowedTones?.length
-      ? input.allowedTones.filter((t) => TONE_IDS.includes(t))
-      : profileAllowedTonesRaw.split(',').map((t) => t.trim());
+    // systemInstruction separato; temperature 0.8
+    const response = await fetch(URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: systemInstruction }],
+        },
+        contents: [{ parts: [{ text: userPrompt }] }],
+        generationConfig: { temperature: 0.8, maxOutputTokens: 8192 },
+      }),
+    });
 
-    // Rigenerazione singolo tono: genera solo quello richiesto
-    if (input.singleToneTarget) {
-      if (allowedTones.includes(input.singleToneTarget)) {
-        allowedTones = [input.singleToneTarget];
-      } else {
-        throw new Error(`Profilo non autorizzato per il tono: ${input.singleToneTarget}`);
-      }
+    if (!response.ok) {
+      throw new AppError(`HTTP Error Gemini: ${response.status}`, {
+        code: 'GEMINI_HTTP',
+        retryable: response.status === 429 || response.status >= 500,
+        step: 'generation',
+      });
     }
 
-    // Un tono alla volta: ogni tono ha prompt e template diversi
-    for (const currentTone of allowedTones) {
-      const toneTemplate = await redis.hget('prism:config:tones', currentTone);
-      if (!toneTemplate) continue; // tono senza template configurato → salta
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const text = extractToneText(rawText);
 
-      // Prompt completo assemblato da regole Redis + dati Refiner + topic utente
-      const singlePrompt = `
-        ${coreRules || ''}
-        ${epistemeRules || ''}
-        ${platformRules || ''}
-
-        [[ REGOLE SPECIFICHE PER IL TONO CORRENTE ]]
-        ${toneTemplate}
-        
-        ⚠️ REQUISITO DI CONTENIMENTO TASSATIVO (HARD CONSTRAINT):
-        NON rispondere in formato JSON o XML.
-        VIETATO racchiudere i marcatori strutturali all'interno di blocchi di codice Markdown (NON usare i tripli backtick \`\`\`).
-        Stampa il testo libero del post direttamente ed esclusivamente all'interno dei delimitatori esatti:
-
-        <<<START_TONE>>>
-        (Inserisci qui l'intero contenuto del post completo, non interromperlo mai a metà)
-        <<<END_TONE>>>
-
-        [[ DATI DI INPUT STRUTTURATI (REFINED) ]]
-        FATTI COMPRESSI:
-        ${fattiComprimibili}
-
-        TABELLE DI RIFERIMENTO:
-        ${tabelleCtx}
-
-        [[ DATI DI INPUT ]]
-        ARGOMENTO: "${input.topic || 'Nessun argomento'}"
-        RIFERIMENTI FONTI: ${fontiTestuali}
-        LINGUA_OUTPUT: "${input.language || 'it'}"
-        ${instructionsBlock}
-        GENERA L'OUTPUT RISPETTANDO I DELIMITATORI <<< >>>. NON AGGIUNGERE ALTRO PRIMA O DOPO I DELIMITATORI. COMPLETA TUTTI I DISCORSI.
-      `;
-
-      console.log(`\n--- PROMPT INPUT PER ${currentTone} ---\n${singlePrompt}\n------------------------------------------\n`);
-
-      let extractedText = '';
-      let authorityMode = 'DOCUMENT-BOUND MODE';
-
-      if (USE_MOCK) {
-        console.log(`🧪 [MOCK] Simulazione completata per ${currentTone}`);
-        extractedText = `Contenuto mock per ${currentTone} su: ${input.topic}. <<<START_TONE>>>Testo simulato riguardante ${input.topic}<<<END_TONE>>>`;
-        authorityMode = 'MOCK-GENERATED';
-      } else {
-        const response = await fetch(URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: singlePrompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 8192 },
-          }),
-        });
-
-        if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-        const data = await response.json();
-        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-
-        // Estrae solo il testo tra i delimitatori, ignorando eventuale testo extra di Gemini
-        const startTag = '<<<START_TONE>>>';
-        const endTag = '<<<END_TONE>>>';
-        const startIndex = rawText.indexOf(startTag);
-        const endIndex = rawText.indexOf(endTag);
-
-        extractedText = (startIndex !== -1 && endIndex !== -1)
-          ? rawText.substring(startIndex + startTag.length, endIndex).trim()
-          : rawText.trim();
-      }
-
-      finalTones[currentTone] = { text: extractedText, authority: authorityMode };
-
-      // Pausa tra toni per non superare i rate limit di Google
-      if (!USE_MOCK) await delay(2000);
-    }
-
-    return finalTones;
+    return { text, authority: 'DOCUMENT-BOUND MODE', toneKey };
   } catch (error) {
     console.error('❌ Errore Generator:', error.message);
     throw error;

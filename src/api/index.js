@@ -1,99 +1,105 @@
 /**
- * API PRISM — server HTTP che riceve le richieste dal frontend.
+ * API PRISM — server HTTP usato dal frontend.
  *
- * Cosa fa:
- * - Crea job e li mette in coda (BullMQ/Redis)
- * - Risponde al frontend con jobId per fare polling dello stato
- * - Espone /health e /ready per monitoraggio produzione
+ * Endpoint tenuti (unico contratto frontend):
+ * - POST /api/prepare-shaping          → analisi F0→F3 (niente generazione testi)
+ * - POST /api/regenerate-tone-surgical → genera/rigenera UN solo tono
+ * - GET  /jobs/status/:userId/:jobId   → polling stato job
+ * - GET  /health e /ready              → monitoraggio infrastruttura
  *
- * Miglioramenti produzione:
- * - jobId generato PRIMA → Redis creato prima della coda (niente race col worker)
- * - Se accodamento fallisce → cancella Redis (niente job fantasma)
- * - Shutdown graceful su deploy/restart
- * - requestId su ogni richiesta per tracciare errori nei log
+ * Flusso tipico UI:
+ * 1) prepare-shaping → polling fino a completed (pilastri + toni ON/OFF)
+ * 2) regenerate-tone-surgical per ogni tono che l'utente attiva/rigenera
  */
 
 import express from 'express';
 import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
 import { randomUUID } from 'crypto';
-import { fileURLToPath } from 'url';
-import { Queue } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
+// Redis: coda BullMQ + stato job durante l'elaborazione
 import redisConnection, { closeRedis, isRedisReady, pingRedis } from '../utils/redis.js';
-import { logError } from '../utils/errors.js';
+// Errori tipizzati + log strutturato
+import { AppError, logError } from '../utils/errors.js';
+// Chiude API/coda/Redis in modo pulito su Ctrl+C o deploy
 import { registerProcessHandlers } from '../utils/processHandlers.js';
 import {
-  initializeRedisJob,
-  getRedisJob,
-  getFirestoreJob,
-  patchRedisJob,
-  hydrateRedisFromFirestore,
-  getJobStatusForClient,
-  updateToneOnRedis,
-  deleteRedisJob,
-  normalizePlatform,
-  MAX_INSTRUCTIONS_LENGTH,
+  initializeRedisJob, // crea record Redis prima di accodare
+  getRedisJob, // legge job da Redis
+  getFirestoreJob, // legge job già consolidato su Firestore
+  patchRedisJob, // aggiorna campi del job in Redis
+  hydrateRedisFromFirestore, // ricarica job da Firestore a Redis (per regen)
+  getJobStatusForClient, // payload compatto per il polling frontend
+  deleteRedisJob, // rollback se l'accodamento fallisce
+  normalizePlatform, // linkedin → LinkedIn, ecc.
 } from '../services/stateManager.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LOGS_DIR = path.resolve(__dirname, '../../logs'); // cartella log errori frontend
-const ERROR_LOG_FILE = path.join(LOGS_DIR, 'production_errors.log');
+// Controlla companies/{id}.enabled_tones prima di generare un tono
+import { assertToneEnabledForCompany, normalizeToneKey } from '../services/companyAccess.js';
 
 const app = express();
-app.use(cors()); // permette richieste dal browser su dominio diverso
-app.use(express.json()); // parse body JSON automatico
+app.use(cors()); // permette chiamate dal browser su altro dominio
+app.use(express.json()); // body JSON → req.body
 
-// Ogni richiesta HTTP riceve un ID corto per ritrovarla nei log se qualcosa va storto
+// Ogni richiesta HTTP riceve un ID corto per ritrovarla nei log
 app.use((req, res, next) => {
   req.requestId = randomUUID().slice(0, 8);
   res.setHeader('X-Request-Id', req.requestId);
   next();
 });
 
-// Coda BullMQ: lista di job che il worker preleverà uno alla volta
+// Coda BullMQ: l'API mette i job, il worker li preleva
 const prismQueue = new Queue('prism-jobs', { connection: redisConnection });
+// Eventi coda: servono ad attendere il risultato di regenerate-tone-surgical
+const prismQueueEvents = new QueueEvents('prism-jobs', { connection: redisConnection });
 
-const ensureLogsDir = () => {
-  if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
-};
+/** Limite caratteri per istruzioni aggiuntive in rigenerazione */
+const REGEN_INSTRUCTIONS_MAX = 2000;
+/** Timeout (ms) attesa generazione tono prima di rispondere al frontend */
+const REGEN_WAIT_MS = 120_000;
 
 /**
- * Accoda un job in modo sicuro.
+ * Accoda un job di analisi (prepare-shaping) in modo sicuro.
  *
- * Ordine IMPORTANTE:
- * 1. Crea record in Redis (così il worker trova subito i dati)
- * 2. Metti il job in coda BullMQ
- * 3. Se la coda fallisce → cancella Redis (rollback)
+ * Ordine:
+ * 1) Crea il record in Redis (il worker deve trovarlo subito)
+ * 2) Metti il job in coda BullMQ
+ * 3) Se la coda fallisce → cancella Redis (niente job fantasma)
  *
- * Prima facevamo queue.add PRIMA di Redis: il worker poteva partire
- * e non trovare il job → errore "Job Redis non trovato".
+ * @param {string} jobId
+ * @param {object} payload — userId, companyId, topic, platform, language, action
+ * @param {object} queueOpts — attempts, backoff, removeOnComplete...
  */
-const enqueueJob = async (jobId, payload, queueOpts) => {
+const enqueueAnalysisJob = async (jobId, payload, queueOpts) => {
+  // Scrive lo stato iniziale in Redis (status pending, toni vuoti, ecc.)
   await initializeRedisJob(payload.userId, jobId, {
     companyId: payload.companyId,
     topic: payload.topic,
     platform: payload.platform || 'general',
     language: payload.language || 'italiano',
-    action: payload.action || 'standard',
+    action: 'shaping_only', // sempre analisi F0→F3, mai F4
   });
 
   try {
-    await prismQueue.add('generate-content', payload, { jobId, ...queueOpts });
+    // Accoda con lo stesso jobId usato in Redis
+    await prismQueue.add(
+      'prepare-shaping',
+      { ...payload, action: 'shaping_only' },
+      { jobId, ...queueOpts },
+    );
   } catch (err) {
-    await deleteRedisJob(payload.userId, jobId).catch(() => {}); // rollback
+    // Rollback: senza questo resterebbe un job Redis orfano
+    await deleteRedisJob(payload.userId, jobId).catch(() => {});
     throw err;
   }
 
   return jobId;
 };
 
-/** /health = "sono vivo?" — usato da load balancer, non controlla Redis */
+/** /health = processo vivo (load balancer), non verifica Redis */
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-/** /ready = "posso servire traffico?" — controlla che Redis risponda al ping */
+/** /ready = può servire traffico? Controlla che Redis risponda al ping */
 app.get('/ready', async (_req, res) => {
   try {
     await pingRedis();
@@ -103,64 +109,44 @@ app.get('/ready', async (_req, res) => {
   }
 });
 
-/** POST /api/generate — avvia pipeline completa F1→F4 (generazione contenuti) */
-app.post('/api/generate', async (req, res) => {
-  const { userId, companyId, topic, platform, language, maxChars } = req.body;
-  if (!userId || !topic) return res.status(400).json({ error: 'Missing userId or topic' });
-  if (!companyId) return res.status(400).json({ error: 'Missing companyId' });
-
-  // UUID generato qui: stesso ID per Redis e per la coda
-  const jobId = randomUUID();
-
-  try {
-    await enqueueJob(jobId, {
-      userId,
-      companyId,
-      topic,
-      platform,
-      language: language || 'italiano',
-      maxChars,
-      action: 'standard',
-    }, {
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 5000 },
-      removeOnComplete: true,
-      removeOnFail: false,
-    });
-
-    res.json({ success: true, jobId });
-  } catch (error) {
-    logError('API:generate', error, { requestId: req.requestId, jobId });
-    res.status(500).json({ error: 'Internal Server Error', requestId: req.requestId });
-  }
-});
-
-/** POST /api/prepare-shaping — solo analisi F1→F3, senza generazione testi (shaping_only) */
+/**
+ * POST /api/prepare-shaping
+ * Avvia l'analisi editoriale: F0 (URL) → F1 Shaper → F2 Search → F3 Refiner.
+ * NON genera testi dei toni: quello lo fa regenerate-tone-surgical.
+ *
+ * Body: { userId, companyId, topic, platform?, language? }
+ * Risposta: { success, jobId } → poi polling su /jobs/status
+ */
 app.post('/api/prepare-shaping', async (req, res) => {
   const { userId, companyId, topic, platform, language } = req.body;
+  // Parametri minimi obbligatori
   if (!userId || !topic || !companyId) {
     return res.status(400).json({ error: 'Missing userId, companyId or topic' });
   }
 
-  // UUID generato qui: stesso ID per Redis e per la coda
+  // Stesso UUID per Redis e per BullMQ
   const jobId = randomUUID();
 
   try {
-    await enqueueJob(jobId, {
-      userId,
-      companyId,
-      topic,
-      platform,
-      language,
-      action: 'shaping_only',
-    }, {
-      attempts: 2,
-      backoff: { type: 'exponential', delay: 5000 },
-      removeOnComplete: true,
-      removeOnFail: false,
-    });
+    await enqueueAnalysisJob(
+      jobId,
+      {
+        userId,
+        companyId,
+        topic,
+        platform,
+        language: language || 'italiano',
+        action: 'shaping_only',
+      },
+      {
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    );
 
-    console.log(`🧠 [SERVER] Job ${jobId} accodato (Redis).`);
+    console.log(`🧠 [API] prepare-shaping accodato: ${jobId}`);
     res.json({ success: true, jobId });
   } catch (error) {
     logError('API:prepare-shaping', error, { requestId: req.requestId, jobId });
@@ -168,7 +154,10 @@ app.post('/api/prepare-shaping', async (req, res) => {
   }
 });
 
-/** GET /jobs/status — polling frontend: a che punto è il job? */
+/**
+ * GET /jobs/status/:userId/:jobId
+ * Polling frontend: a che punto è il job di analisi (o dopo una regen)?
+ */
 app.get('/jobs/status/:userId/:jobId', async (req, res) => {
   try {
     const { userId, jobId } = req.params;
@@ -178,6 +167,7 @@ app.get('/jobs/status/:userId/:jobId', async (req, res) => {
       return res.status(404).json({ success: false, error: 'JOB_NOT_FOUND' });
     }
 
+    // failed/blocked → success false ma con dettagli utili alla UI
     if (jobStatus.status === 'failed' || jobStatus.status === 'blocked') {
       return res.json({ success: false, ...jobStatus });
     }
@@ -189,44 +179,108 @@ app.get('/jobs/status/:userId/:jobId', async (req, res) => {
   }
 });
 
-/** POST /api/regenerate-tone-surgical — rigenera un solo tono su job esistente */
+/**
+ * POST /api/regenerate-tone-surgical
+ * Genera o rigenera UN solo tono su un job già analizzato (prepare-shaping completed).
+ *
+ * Input: tono, lingua, piattaforma, argomento, istruzioni, contenuto precedente,
+ *        più userId, companyId, jobId.
+ * Output: { contenutoGenerato } oppure { error }.
+ */
 app.post('/api/regenerate-tone-surgical', async (req, res) => {
   try {
-    const { userId, companyId, toneKey, jobId, platform, language, instructions } = req.body;
-    if (!userId || !companyId || !toneKey || !jobId) {
-      return res.status(400).json({ success: false, error: 'Parametri mancanti.' });
+    const body = req.body || {};
+    // Accetta nomi IT e EN per i campi di input
+    const userId = body.userId;
+    const companyId = body.companyId;
+    const jobId = body.jobId;
+    const toneKey = normalizeToneKey(body.tono || body.toneKey);
+    const language = body.linguaOutput || body.lingua || body.language;
+    const platform = body.piattaforma || body.platform;
+    const topic = body.argomento || body.topic;
+    // Prima generazione: istruzioni/contenuto precedente opzionali (usati in altro flusso di regen)
+    const instructionsRaw = body.istruzioniAggiuntive || body.istruzioni || body.instructions || '';
+    const previousContent =
+      body.contenutoPrecedente || body.contenuto_precedente || body.previousContent || '';
+
+    // Obbligatori: userId, companyId, jobId, tono, lingua, piattaforma
+    if (!userId || !companyId || !toneKey || !jobId || !language || !platform) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'Parametri mancanti (userId, companyId, tono/toneKey, jobId, linguaOutput/language, piattaforma/platform).',
+        contenutoGenerato: null,
+      });
     }
 
+    // Blocco immediato se la company non ha il tono in enabled_tones
+    try {
+      await assertToneEnabledForCompany(companyId, toneKey);
+    } catch (accessErr) {
+      const msg =
+        accessErr?.message ||
+        `Utente non abilitato alla generazione del tono (${toneKey}).`;
+      return res.status(403).json({
+        success: false,
+        error: msg,
+        contenutoGenerato: null,
+      });
+    }
+
+    // Carica il job: prima Redis (in corso), poi Firestore (già consolidato)
     let job = await getRedisJob(userId, jobId);
     if (!job) job = await getFirestoreJob(jobId);
-    if (!job) return res.status(404).json({ success: false, error: 'Task non trovato.' });
-
-    if (job.tones?.[toneKey]?.status === 'OFF') {
-      return res.status(400).json({ success: false, error: `Tono ${toneKey} bloccato: ${job.tones[toneKey].lock_reason}` });
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: 'Task non trovato.',
+        contenutoGenerato: null,
+      });
     }
 
-    if (!await getRedisJob(userId, jobId)) {
+    // Lo Shaper ha messo questo tono OFF → non generare
+    if (job.tones?.[toneKey]?.status === 'OFF') {
+      return res.status(400).json({
+        success: false,
+        error: `Tono ${toneKey} bloccato: ${job.tones[toneKey].lock_reason}`,
+        contenutoGenerato: null,
+      });
+    }
+
+    // Job solo su Firestore → riporta in Redis per il worker
+    if (!(await getRedisJob(userId, jobId))) {
       await hydrateRedisFromFirestore(userId, jobId);
     }
 
-    const regenInstructions = instructions
-      ? String(instructions).slice(0, MAX_INSTRUCTIONS_LENGTH)
+    // Baseline: body oppure testo già salvato sul tono
+    const previous =
+      String(previousContent || '').trim() ||
+      String(job.tones?.[toneKey]?.text || '').trim();
+
+    // Taglia istruzioni troppo lunghe
+    const regenInstructions = instructionsRaw
+      ? String(instructionsRaw).slice(0, REGEN_INSTRUCTIONS_MAX)
       : '';
 
+    // ID del job BullMQ di regen (diverso dal parentJobId del contenuto)
     const regenJobId = randomUUID();
+    const resolvedPlatform = normalizePlatform(platform);
+    const resolvedLanguage = String(language).trim();
+    const resolvedTopic = topic || job.topic || '';
 
-    // Prima accoda il lavoro, POI aggiorna lo stato in Redis.
-    // Se accodamento fallisce, lo stato del job originale non resta bloccato su "generating".
-    await prismQueue.add(
-      'generate-content',
+    // Accoda SOLO la generazione del tono (action regen_tone)
+    const bullJob = await prismQueue.add(
+      'regen-tone',
       {
         userId,
         companyId,
         toneKey,
-        platform: normalizePlatform(platform || job.platform),
-        language: language || job.language,
+        platform: resolvedPlatform,
+        language: resolvedLanguage,
+        topic: resolvedTopic,
         instructions: regenInstructions,
-        parentJobId: jobId,
+        previousContent: previous,
+        parentJobId: jobId, // job di analisi su cui salvare il testo
         action: 'regen_tone',
       },
       {
@@ -235,76 +289,81 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
         backoff: { type: 'exponential', delay: 5000 },
         removeOnComplete: true,
         removeOnFail: false,
-      }
+      },
     );
 
+    // Aggiorna lo stato del job padre per il polling UI
     await patchRedisJob(userId, jobId, {
       status: 'generating',
-      workerState: { currentStep: 'generation', progress: 0.2, updatedAt: new Date().toISOString() },
-      ...(platform ? { platform: normalizePlatform(platform) } : {}),
-      ...(language ? { language } : {}),
+      workerState: {
+        currentStep: 'generation',
+        progress: 0.2,
+        updatedAt: new Date().toISOString(),
+      },
+      platform: resolvedPlatform,
+      language: resolvedLanguage,
     });
 
-    res.json({ success: true, jobId });
+    // Attende il worker e restituisce subito il contenuto (o l'errore)
+    try {
+      const result = await bullJob.waitUntilFinished(prismQueueEvents, REGEN_WAIT_MS);
+      const contenutoGenerato = result?.text || result?.contenutoGenerato || null;
+      if (!contenutoGenerato) {
+        return res.status(500).json({
+          success: false,
+          error: 'Generazione completata ma senza contenuto.',
+          contenutoGenerato: null,
+          jobId,
+        });
+      }
+      return res.json({
+        success: true,
+        contenutoGenerato,
+        jobId,
+        toneKey,
+      });
+    } catch (waitErr) {
+      const message =
+        waitErr?.message ||
+        waitErr?.failedReason ||
+        'Errore durante la generazione del tono.';
+      return res.status(500).json({
+        success: false,
+        error: message,
+        contenutoGenerato: null,
+        jobId,
+      });
+    }
   } catch (error) {
     logError('API:regenerate-tone', error, { requestId: req.requestId });
-    res.status(500).json({ success: false, error: error.message || 'Internal Server Error', requestId: req.requestId });
-  }
-});
-
-/** POST /api/update-tone-redis — salva modifica manuale testo tono da editor UI */
-app.post('/api/update-tone-redis', async (req, res) => {
-  try {
-    const { userId, jobId, toneKey, text } = req.body;
-    if (!userId || !jobId || !toneKey || text === undefined) {
-      return res.status(400).json({ success: false, error: 'Dati incompleti.' });
-    }
-
-    await updateToneOnRedis(userId, jobId, toneKey, text);
-    res.json({ success: true });
-  } catch (error) {
-    logError('API:update-tone', error, { requestId: req.requestId });
-    res.status(500).json({ success: false, error: 'Internal Server Error', requestId: req.requestId });
-  }
-});
-
-/** POST /api/log-error — il frontend invia errori JavaScript da salvare su file */
-app.post('/api/log-error', async (req, res) => {
-  try {
-    const { type, message, filename, lineno, colno, stack, url, userId } = req.body;
-    if (!message) return res.status(400).json({ success: false, error: "Campo 'message' obbligatorio." });
-
-    ensureLogsDir();
-    await fs.promises.appendFile(ERROR_LOG_FILE, JSON.stringify({
-      timestamp: new Date().toISOString(),
-      type: type || 'unknown',
-      message: String(message).slice(0, 2000),
-      filename, lineno, colno,
-      stack: stack ? String(stack).slice(0, 8000) : null,
-      url, userId,
+    const status =
+      error instanceof AppError && error.code === 'TONE_NOT_ENABLED' ? 403 : 500;
+    res.status(status).json({
+      success: false,
+      error: error.message || 'Internal Server Error',
+      contenutoGenerato: null,
       requestId: req.requestId,
-    }) + '\n', 'utf8');
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    });
   }
 });
 
 const PORT = process.env.PORT || 3001;
-const server = app.listen(PORT, () => console.log(`📡 API PRISM attiva sulla porta ${PORT}`));
+const server = app.listen(PORT, () =>
+  console.log(`📡 API PRISM attiva sulla porta ${PORT}`),
+);
 
-// Su deploy/restart: chiude server HTTP → coda → Redis, in ordine
+// Su deploy/restart: chiude HTTP → coda → eventi → Redis
 registerProcessHandlers({
   label: 'api',
   onShutdown: async () => {
-    await new Promise((resolve) => server.close(resolve)); // smette di accettare nuove richieste
+    await new Promise((resolve) => server.close(resolve));
     await prismQueue.close();
+    await prismQueueEvents.close();
     await closeRedis();
   },
 });
 
-// Verifica connessione Redis all'avvio
+// Verifica Redis all'avvio (warning se down, il server resta su)
 pingRedis()
   .then(() => console.log('✅ API connessa a Redis'))
   .catch((err) => logError('api:startup:redis', err));
