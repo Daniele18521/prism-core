@@ -114,11 +114,42 @@ describe('toneGatekeeper — enforceToneSuitability', () => {
       visionario: { status: 'ON', lock_reason: '' },
       metodologico: { status: 'ON', lock_reason: '' },
       narratore: { status: 'ON', lock_reason: '' },
+      promotore: { status: 'ON', lock_reason: '' },
     });
     assert.equal(out.provocatore.status, 'OFF');
     assert.equal(out.sferzante.status, 'OFF');
+    assert.equal(out.promotore.status, 'OFF');
+    assert.equal(out.promotore.lock_reason, LOCK_REASONS.promotore_sensitive);
     assert.equal(out.confidente.status, 'ON');
     assert.equal(out.narratore.status, 'ON');
+  });
+
+  test('lancio prodotto + webinar → promotore ON', () => {
+    const out = enforceToneSuitability(
+      'Lancio del nuovo prodotto SaaS e campagna webinar per le iscrizioni',
+      { promotore: { status: 'OFF', lock_reason: 'x' } },
+      { enabledTones: ['promotore', 'confidente'] },
+    );
+    assert.equal(out.promotore.status, 'ON');
+    assert.deepEqual(Object.keys(out).sort(), ['confidente', 'promotore']);
+  });
+
+  test('analisi impatto senza CTA → promotore OFF', () => {
+    const out = enforceToneSuitability(
+      'Analisi dell\'impatto del PIL italiano sui consumi 2026',
+      { promotore: { status: 'ON', lock_reason: '' } },
+    );
+    assert.equal(out.promotore.status, 'OFF');
+    assert.equal(out.promotore.lock_reason, LOCK_REASONS.promotore);
+  });
+
+  test('critica concorrenti → promotore OFF etica', () => {
+    const out = enforceToneSuitability(
+      'Perché il nostro concorrente fallisce: campagna denigratoria 2026',
+      { promotore: { status: 'ON', lock_reason: '' } },
+    );
+    assert.equal(out.promotore.status, 'OFF');
+    assert.equal(out.promotore.lock_reason, LOCK_REASONS.promotore_ethics);
   });
 
   test('business generico → tutti ON anche se Gemini spegne', () => {

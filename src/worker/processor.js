@@ -37,9 +37,10 @@ import {
   writeGeneratedTone,
   isTerminalJobStatus,
   normalizePlatform,
+  TONE_IDS,
 } from '../services/stateManager.js';
-// F1: diagnosi GAP + toni ON/OFF
-import { runShaperGatekeeper } from '../services/shaper.js';
+// F1: diagnosi GAP + toni ON/OFF (+ normalizza mock come F1 reale)
+import { runShaperGatekeeper, normalizeShaperOutput } from '../services/shaper.js';
 // F0: estrazione testo da URL (Tavily Extract)
 import { resolveInput } from '../services/contentIngest.js';
 // F2: ricerche web etichettate
@@ -48,8 +49,12 @@ import { performWebSearch } from '../services/search.js';
 import { refineResults } from '../services/refiner.js';
 // F4: generazione di UN tono (solo path regen_tone)
 import { generateTones } from '../services/generator.js';
-// Verifica companies.enabled_tones
-import { assertToneEnabledForCompany } from '../services/companyAccess.js';
+// Verifica companies.enabled_tones + lista toni per F1
+import {
+  assertToneEnabledForCompany,
+  getCompanyEnabledTones,
+  resolveEnabledToneIds,
+} from '../services/companyAccess.js';
 // BYPASS_DATA_CUTTING: TRUE solo se search_required=false (input utente completo)
 import { resolveBypassDataCutting } from '../services/promptLoader.js';
 
@@ -82,26 +87,25 @@ const mockContentIngest = (url) => {
   };
 };
 
-/** Dati finti F1 per test locali senza Gemini */
-const mockShaper = (topic) => ({
-  is_blocked: false,
-  block_message: '',
-  diagnosi: { scenario: 'GAP', context: 'GAP', sfide_opportunita: 'GAP' },
-  search_required: true,
-  tone_suitability: {
-    provocatore: { status: 'ON', lock_reason: '' },
-    confidente: { status: 'OFF', lock_reason: 'Perchè non voglio che produca testi confidenziali.' },
-    sferzante: { status: 'ON', lock_reason: '' },
-    visionario: { status: 'OFF', lock_reason: 'Perchè non voglio che produca testi visionari.' },
-    metodologico: { status: 'ON', lock_reason: '' },
-    narratore: { status: 'ON', lock_reason: '' },
-  },
-  plan: [
-    { pillar: 'SCENARIO', query: `statistiche ${topic} ${new Date().getFullYear()}` },
-    { pillar: 'CONTESTO', query: `trend ${topic} ${new Date().getFullYear() - 1}` },
-    { pillar: 'SFIDE_OPPORTUNITA', query: `criticità ${topic} ${new Date().getFullYear()}` },
-  ],
-});
+/** Dati finti F1 per test locali senza Gemini (include promotore se in catalogo) */
+const mockShaper = (topic, enabledTones = TONE_IDS) => {
+  const tone_suitability = {};
+  for (const id of enabledTones) {
+    tone_suitability[id] = { status: 'ON', lock_reason: '' };
+  }
+  return {
+    is_blocked: false,
+    block_message: '',
+    diagnosi: { scenario: 'GAP', context: 'GAP', sfide_opportunita: 'GAP' },
+    search_required: true,
+    tone_suitability,
+    plan: [
+      { pillar: 'SCENARIO', query: `statistiche ${topic} ${new Date().getFullYear()}` },
+      { pillar: 'CONTESTO', query: `trend ${topic} ${new Date().getFullYear() - 1}` },
+      { pillar: 'SFIDE_OPPORTUNITA', query: `criticità ${topic} ${new Date().getFullYear()}` },
+    ],
+  };
+};
 
 /** Dati finti F2 — una fonte web simulata */
 const mockTavily = () => ({
@@ -208,10 +212,28 @@ const runAnalysisPipeline = async ({ uid, targetJobId, topic }) => {
     console.log(`🧠 [WORKER][${targetJobId}] F1 Shaper...`);
     maybeSimulateFault('query_shaping');
 
+    // Toni da valutare = companies.enabled_tones (dinamico per company)
+    const companyId = state.companyId;
+    let enabledTones = TONE_IDS;
+    if (companyId) {
+      const rawEnabled = await getCompanyEnabledTones(companyId);
+      const resolved = resolveEnabledToneIds(rawEnabled);
+      if (resolved.length > 0) enabledTones = resolved;
+      else {
+        console.warn(
+          `⚠️ [WORKER][${targetJobId}] enabled_tones vuoto/non valido → fallback catalogo completo.`,
+        );
+      }
+    }
+
     const shaperTopic = state.topic || topic;
+    const shaperRaw = IS_MOCK
+      ? mockShaper(shaperTopic, enabledTones)
+      : await runShaperGatekeeper(shaperTopic, { enabledTones });
+    // Mock: applica stesso gatekeeper/filtro company della F1 reale
     const shaperOut = IS_MOCK
-      ? mockShaper(shaperTopic)
-      : await runShaperGatekeeper(shaperTopic);
+      ? normalizeShaperOutput(shaperRaw, shaperTopic, { enabledTones })
+      : shaperRaw;
     state = await writeShapingToRedis(uid, targetJobId, shaperOut);
 
     // Input non ammesso → blocked e stop (niente F2/F3)

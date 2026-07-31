@@ -15,6 +15,10 @@ export const LOCK_REASONS = {
   sferzante: "Incompatibile con l'ironia",
   visionario: 'Tema puramente storico',
   metodologico: 'Nessuna leva metodologica',
+  promotore: 'Tono sprecato senza obiettivo di conversione',
+  promotore_sensitive: 'Tono inappropriato su crisi o alta sensibilità',
+  promotore_ethics: 'Prism non denigra concorrenti o prodotti altrui',
+  promotore_honesty: 'Persuasione deve restare legata a fatti reali',
 };
 
 /** Toni sempre disponibili, senza eccezioni editoriali */
@@ -127,6 +131,72 @@ const COMMERCIAL_WAR_PATTERNS = [
   /\bprice war\b/,
 ];
 
+/**
+ * Fit commerciale → promotore ON
+ * (lanci, campagne, eventi, opportunità di crescita/investimento)
+ */
+const PROMOTORE_FIT_PATTERNS = [
+  /\blanc(io|iare|iato)\b/,
+  /\bnuov[oa] (prodotto|servizio|funzionalit)/,
+  /\bcampagn[ae]\b/,
+  /\bpromo(zion[ei])?\b/,
+  /\boffert[ae]\b/,
+  /\bsconto\b/,
+  /\binvito\b/,
+  /\bwebinar\b/,
+  /\bconferenz/,
+  /\bevento\b/,
+  /\beventi\b/,
+  /\biscrizione\b/,
+  /\binvestiment/,
+  /\bfunding\b/,
+  /\bround\b/,
+  /\bcrescita aziendale\b/,
+  /\bopportunita (di|di business|commerciale)/,
+  /\bcall to action\b/,
+  /\bcta\b/,
+  /\bprenota\b/,
+  /\bacquist/,
+];
+
+/** Critica diretta a concorrenti → promotore OFF (etica) */
+const PROMOTORE_COMPETITOR_PATTERNS = [
+  /\bconcorrent/,
+  /\bcompetitor\b/,
+  /\bvs\b.{0,40}\b(brand|prodotto|azienda)/,
+  /\bpeggio (di|del|della)\b/,
+  /\bsuperiore a .{0,30}(concorrent|rival)/,
+  /\bdenigr/,
+  /\bscredit/,
+];
+
+/** Promesse irrealistiche → promotore OFF */
+const PROMOTORE_UNREALISTIC_PATTERNS = [
+  /\bgarantito al 100\b/,
+  /\bsenza (alcun )?sforzo\b/,
+  /\bdiventa(re)? milionar/,
+  /\bricc(hi|o) subito\b/,
+  /\bmiracol/,
+  /\bzero rischi\b/,
+  /\bguadagni facili\b/,
+];
+
+/**
+ * Contenuto puramente analitico / informativo senza leva di conversione
+ * (usato solo se manca PROMOTORE_FIT)
+ */
+const PROMOTORE_ANALYTICAL_PATTERNS = [
+  /\banalisi\b/,
+  /\breport\b/,
+  /\bstudio (su|sul|sulla|dei|delle)\b/,
+  /\bimpatto (di|del|della|dei|delle)\b/,
+  /\bdati (su|sul|sulla)\b/,
+  /\bstatistich/,
+  /\bquadro (di|del)\b/,
+  /\bpanoramica\b/,
+  /\brassegna\b/,
+];
+
 /** Tema puramente storico → spegne visionario */
 const HISTORICAL_PATTERNS = [
   /\barcheolog/,
@@ -196,6 +266,11 @@ export const classifyTopicForTones = (topic) => {
   const hasFutureLink = anyMatch(text, FUTURE_LINK_PATTERNS);
   const looksAbstract = anyMatch(text, ABSTRACT_PATTERNS);
   const hasPractical = anyMatch(text, PRACTICAL_PATTERNS);
+  const isPromotoreFit = anyMatch(text, PROMOTORE_FIT_PATTERNS);
+  const isCompetitorAttack = anyMatch(text, PROMOTORE_COMPETITOR_PATTERNS);
+  const isUnrealisticPromise = anyMatch(text, PROMOTORE_UNREALISTIC_PATTERNS);
+  const isPureAnalytical =
+    anyMatch(text, PROMOTORE_ANALYTICAL_PATTERNS) && !isPromotoreFit;
 
   return {
     isPolitical,
@@ -203,6 +278,10 @@ export const classifyTopicForTones = (topic) => {
     isHumanitarian,
     isPureHistorical: looksHistorical && !hasFutureLink && !isPolitical,
     isPureAbstract: looksAbstract && !hasPractical && !isPolitical,
+    isPromotoreFit,
+    isCompetitorAttack,
+    isUnrealisticPromise,
+    isPureAnalytical,
   };
 };
 
@@ -221,42 +300,87 @@ const forceOff = (entry, reason) => ({ ...entry, status: 'OFF', lock_reason: rea
 
 /**
  * Applica le regole hard sui toni proposti da Gemini.
- * Principio: OFF solo se il detector conferma; altrimenti ON.
+ * Principio: OFF solo se il detector conferma; altrimenti ON (tranne promotore: serve fit conversione).
+ * Se `enabledTones` è passato, l’output contiene **solo** quei toni (lista company).
  *
  * @param {string} topic — testo input (topic o testo F0)
  * @param {Record<string, {status: string, lock_reason: string}>} tones — già normalizzati
+ * @param {{ enabledTones?: string[] }} [opts]
  * @returns {Record<string, {status: string, lock_reason: string}>}
  */
-export const enforceToneSuitability = (topic, tones = {}) => {
+export const enforceToneSuitability = (topic, tones = {}, opts = {}) => {
   const flags = classifyTopicForTones(topic);
+  const enabledList = Array.isArray(opts.enabledTones)
+    ? opts.enabledTones.map((t) => String(t).toLowerCase().trim()).filter(Boolean)
+    : null;
+  const allowed = enabledList?.length ? new Set(enabledList) : null;
+  const has = (id) => !allowed || allowed.has(id);
+
   const out = { ...tones };
 
   for (const id of ALWAYS_ON) {
+    if (!has(id)) continue;
     out[id] = forceOn(out[id] || { status: 'ON', lock_reason: '' });
   }
 
   // Lutto/tragedia OPPURE umanitario/violenza → spegne entrambi i toni “punchy”
-  if (flags.isSolemn || flags.isHumanitarian) {
-    out.provocatore = forceOff(out.provocatore || {}, LOCK_REASONS.provocatore);
-    out.sferzante = forceOff(out.sferzante || {}, LOCK_REASONS.sferzante);
-  } else {
-    // Default ON su politica, business, scienza, attualità
-    out.provocatore = forceOn(out.provocatore || {});
-    out.sferzante = forceOn(out.sferzante || {});
+  if (has('provocatore') || has('sferzante')) {
+    if (flags.isSolemn || flags.isHumanitarian) {
+      if (has('provocatore')) {
+        out.provocatore = forceOff(out.provocatore || {}, LOCK_REASONS.provocatore);
+      }
+      if (has('sferzante')) {
+        out.sferzante = forceOff(out.sferzante || {}, LOCK_REASONS.sferzante);
+      }
+    } else {
+      if (has('provocatore')) out.provocatore = forceOn(out.provocatore || {});
+      if (has('sferzante')) out.sferzante = forceOn(out.sferzante || {});
+    }
   }
 
   // Visionario: OFF solo tema storico puro senza legami attuali; altrimenti sempre ON
-  if (flags.isPureHistorical) {
-    out.visionario = forceOff(out.visionario || {}, LOCK_REASONS.visionario);
-  } else {
-    out.visionario = forceOn(out.visionario || {});
+  if (has('visionario')) {
+    if (flags.isPureHistorical) {
+      out.visionario = forceOff(out.visionario || {}, LOCK_REASONS.visionario);
+    } else {
+      out.visionario = forceOn(out.visionario || {});
+    }
   }
 
   // Metodologico: OFF solo astratto puro senza leva pratica; altrimenti sempre ON
-  if (flags.isPureAbstract) {
-    out.metodologico = forceOff(out.metodologico || {}, LOCK_REASONS.metodologico);
-  } else {
-    out.metodologico = forceOn(out.metodologico || {});
+  if (has('metodologico')) {
+    if (flags.isPureAbstract) {
+      out.metodologico = forceOff(out.metodologico || {}, LOCK_REASONS.metodologico);
+    } else {
+      out.metodologico = forceOn(out.metodologico || {});
+    }
+  }
+
+  // Promotore: ON solo con leva di conversione; OFF su sensibilità / etica / no-CTA
+  if (has('promotore')) {
+    if (flags.isSolemn || flags.isHumanitarian) {
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore_sensitive);
+    } else if (flags.isCompetitorAttack) {
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore_ethics);
+    } else if (flags.isUnrealisticPromise) {
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore_honesty);
+    } else if (flags.isPromotoreFit) {
+      out.promotore = forceOn(out.promotore || {});
+    } else if (flags.isPureAnalytical) {
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore);
+    } else {
+      // Dubbio senza fit commerciale → OFF (non sprecare conversione)
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore);
+    }
+  }
+
+  // Lista dinamica: solo toni abilitati per la company
+  if (allowed) {
+    const filtered = {};
+    for (const id of enabledList) {
+      filtered[id] = out[id] || { status: 'OFF', lock_reason: '' };
+    }
+    return filtered;
   }
 
   return out;

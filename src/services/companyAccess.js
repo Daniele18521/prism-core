@@ -7,16 +7,11 @@
 
 import { db } from '../utils/firebaseAdmin.js';
 import { AppError } from '../utils/errors.js';
+// Catalogo toni prodotto (unica fonte di verità)
+import { TONE_IDS } from './stateManager.js';
 
 /** Toni editoriali riconosciuti (allineati a stateManager.TONE_IDS) */
-const KNOWN_TONES = [
-  'provocatore',
-  'confidente',
-  'sferzante',
-  'visionario',
-  'metodologico',
-  'narratore',
-];
+const KNOWN_TONES = [...TONE_IDS];
 
 /**
  * Normalizza un nome tono (minuscolo, underscore) per confronti stabili.
@@ -64,6 +59,25 @@ export const getCompanyEnabledTones = async (companyId) => {
   }
 
   return raw.map(normalizeToneKey).filter(Boolean);
+};
+
+/**
+ * Interseca enabled_tones company con il catalogo prodotto.
+ * Ordine = ordine in enabled_tones (come in Firestore).
+ * @param {string[]} enabledRaw
+ * @returns {string[]}
+ */
+export const resolveEnabledToneIds = (enabledRaw = []) => {
+  const known = new Set(KNOWN_TONES);
+  const out = [];
+  const seen = new Set();
+  for (const raw of enabledRaw) {
+    const id = normalizeToneKey(raw);
+    if (!id || !known.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 };
 
 /**

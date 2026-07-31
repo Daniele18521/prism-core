@@ -4,14 +4,16 @@
  * F1 analizza il topic dell'utente e decide:
  * - se bloccare l'input (contenuti non ammessi)
  * - quali pilastri hanno GAP (servono ricerche web)
- * - quali toni editoriali sono ON/OFF
+ * - quali toni editoriali sono ON/OFF (solo quelli in companies.enabled_tones)
  */
 
 import dotenv from 'dotenv';
 // Client condiviso: timeout 60s + retry automatico se Google non risponde
 import { callGeminiJson } from '../utils/geminiClient.js';
-// Regole hard sui toni: Gemini propone, il gatekeeper decide (default ON)
+// Regole hard sui toni: Gemini propone, il gatekeeper decide
 import { enforceToneSuitability } from '../utils/toneGatekeeper.js';
+// Catalogo toni prodotto
+import { TONE_IDS } from './stateManager.js';
 dotenv.config();
 
 // Modello AI usato in F1 (leggero e veloce)
@@ -19,9 +21,6 @@ const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 // Costruisce l'URL completo dell'API Google passando la chiave
 const getApiUrl = (key) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
-
-// I 6 toni editoriali che lo Shaper deve valutare (ON/OFF)
-const TONE_IDS = ['provocatore', 'confidente', 'sferzante', 'visionario', 'metodologico', 'narratore'];
 
 // Schema JSON per ogni tono: solo ON/OFF + motivo blocco
 const toneSchemaEntry = {
@@ -33,8 +32,27 @@ const toneSchemaEntry = {
   required: ['status', 'lock_reason'],
 };
 
-// Schema completo risposta F1 — Gemini è obbligato a rispettarlo (JSON mode)
-const SHAPER_SCHEMA = {
+/**
+ * Costruisce lo schema Gemini per tone_suitability in base ai toni abilitati.
+ * @param {string[]} toneIds
+ */
+const buildToneSuitabilitySchema = (toneIds) => {
+  const properties = {};
+  for (const id of toneIds) {
+    properties[id] = toneSchemaEntry;
+  }
+  return {
+    type: 'OBJECT',
+    properties,
+    required: toneIds,
+  };
+};
+
+/**
+ * Schema risposta F1 — dinamico sui toni company.
+ * @param {string[]} toneIds
+ */
+const buildShaperSchema = (toneIds) => ({
   type: 'OBJECT',
   properties: {
     is_blocked: { type: 'BOOLEAN' },
@@ -49,18 +67,7 @@ const SHAPER_SCHEMA = {
       required: ['scenario', 'context', 'sfide_opportunita'],
     },
     search_required: { type: 'BOOLEAN' },
-    tone_suitability: {
-      type: 'OBJECT',
-      properties: {
-        provocatore: toneSchemaEntry,
-        confidente: toneSchemaEntry,
-        sferzante: toneSchemaEntry,
-        visionario: toneSchemaEntry,
-        metodologico: toneSchemaEntry,
-        narratore: toneSchemaEntry,
-      },
-      required: TONE_IDS,
-    },
+    tone_suitability: buildToneSuitabilitySchema(toneIds),
     plan: {
       type: 'ARRAY',
       items: {
@@ -74,7 +81,7 @@ const SHAPER_SCHEMA = {
     },
   },
   required: ['is_blocked', 'block_message', 'diagnosi', 'search_required', 'tone_suitability', 'plan'],
-};
+});
 
 // Collegamento chiave diagnosi interna → etichetta pilastro in output
 const PILLAR_FIELDS = [
@@ -118,10 +125,14 @@ export const normalizeToneEntry = (entry = {}) => {
   };
 };
 
-/** Normalizza tutti e 6 i toni dopo la risposta Gemini */
-export const normalizeToneSuitability = (toneSuitability = {}) => {
+/**
+ * Normalizza i toni dopo la risposta Gemini (solo le chiavi richieste).
+ * @param {object} toneSuitability
+ * @param {string[]} [toneIds=TONE_IDS]
+ */
+export const normalizeToneSuitability = (toneSuitability = {}, toneIds = TONE_IDS) => {
   const normalized = {};
-  for (const id of TONE_IDS) {
+  for (const id of toneIds) {
     normalized[id] = normalizeToneEntry(toneSuitability[id]);
   }
   return normalized;
@@ -132,12 +143,13 @@ export const normalizeToneSuitability = (toneSuitability = {}) => {
  * - search_required true solo se c'è almeno un GAP
  * - plan vuoto se tutti OK
  * - plan solo per pilastri GAP
- * - toni ON/OFF con gatekeeper deterministico (topic obbligatorio per i toni)
+ * - toni ON/OFF con gatekeeper + filtro enabled_tones company
  *
  * @param {object} parsed — JSON grezzo da Gemini
- * @param {string} [topic=''] — testo input (topic o estratto F0); serve al gatekeeper toni
+ * @param {string} [topic=''] — testo input (topic o estratto F0)
+ * @param {{ enabledTones?: string[] }} [opts]
  */
-export const normalizeShaperOutput = (parsed, topic = '') => {
+export const normalizeShaperOutput = (parsed, topic = '', opts = {}) => {
   const diagnosi = parsed.diagnosi || {};
   const gapPillars = PILLAR_FIELDS.filter(({ key }) => isGap(diagnosi[key]));
   const search_required = gapPillars.length > 0;
@@ -152,9 +164,14 @@ export const normalizeShaperOutput = (parsed, topic = '') => {
     }
   }
 
-  // Prima ripara formato ON/OFF, poi applica regole hard (Gemini non ha l'ultima parola)
-  const tonesFromModel = normalizeToneSuitability(parsed.tone_suitability);
-  const tone_suitability = enforceToneSuitability(topic, tonesFromModel);
+  // Toni da valutare: lista company se presente, altrimenti catalogo pieno
+  const enabledTones =
+    Array.isArray(opts.enabledTones) && opts.enabledTones.length > 0
+      ? opts.enabledTones
+      : TONE_IDS;
+
+  const tonesFromModel = normalizeToneSuitability(parsed.tone_suitability, enabledTones);
+  const tone_suitability = enforceToneSuitability(topic, tonesFromModel, { enabledTones });
 
   return {
     ...parsed,
@@ -165,16 +182,26 @@ export const normalizeShaperOutput = (parsed, topic = '') => {
   };
 };
 
-/** Entry point F1 — analizza topic utente e restituisce diagnosi + plan + toni */
-export const runShaperGatekeeper = async (topic) => {
+/**
+ * Entry point F1 — analizza topic utente e restituisce diagnosi + plan + toni.
+ * @param {string} topic
+ * @param {{ enabledTones?: string[] }} [opts] — toni da companies.enabled_tones
+ */
+export const runShaperGatekeeper = async (topic, opts = {}) => {
   const API_KEY = process.env.GEMINI_API_KEY;
   if (!API_KEY) throw new Error('GEMINI_API_KEY non configurata.');
+
+  const enabledTones =
+    Array.isArray(opts.enabledTones) && opts.enabledTones.length > 0
+      ? opts.enabledTones
+      : TONE_IDS;
 
   // Anni usati nelle query web (vincolo temporale nel prompt)
   const currentYear = new Date().getFullYear();
   const previousYear = currentYear - 1;
+  const tonesList = enabledTones.join(', ');
 
-  // Prompt inviato a Gemini con tutte le regole editoriali
+  // Prompt inviato a Gemini con tutte le regole editoriali (toni = solo quelli company)
   const promptText = `Agisci come il Direttore Editoriale di PRISM.
 INPUT UTENTE: "${topic}"
 
@@ -193,45 +220,50 @@ Se mancano, segna 'GAP'.
 - Ogni voce di plan deve avere pillar uguale esattamente a SCENARIO, CONTESTO o SFIDE_OPPORTUNITA (non titoli descrittivi).
 - Ogni query deve includere l'anno ${currentYear} o ${previousYear}.
 
-3. MATRICE DI IDONEITÀ TONI (chiavi: provocatore, confidente, sferzante, visionario, metodologico, narratore).
+3. MATRICE DI IDONEITÀ TONI — valuta SOLO questi toni (abilitati per l'azienda): ${tonesList}.
 Per ogni tono imposta un oggetto { "status": "ON"|"OFF", "lock_reason": "..." }.
 REGOLE TASSATIVE:
 - status contiene SOLO "ON" o "OFF" (nessun altro testo, mai concatenare il motivo).
 - lock_reason è "" (stringa vuota) se status è "ON".
 - lock_reason è una frase breve (max 120 caratteri) se status è "OFF".
-- DEFAULT: ogni tono è ON. Preferisci ON in caso di dubbio.
-- confidente e narratore: sempre ON.
+- Non inventare toni fuori dalla lista sopra.
+- DEFAULT: ogni tono è ON. Preferisci ON in caso di dubbio (eccetto promotore: vedi sotto).
+- confidente e narratore (se in lista): sempre ON.
 - provocatore e sferzante OFF insieme su: lutto/funerali/vittime di tragedia OPPURE guerra/genocidio/crisi umanitaria/violenza su civili.
 - visionario OFF solo tema puramente storico/archeologico senza attualità (lock_reason: "Tema puramente storico").
 - metodologico OFF solo tema astratto senza problema pratico (lock_reason: "Nessuna leva metodologica").
-- Politica, business, tech, scienza, attualità: TUTTI i toni ON.
+- promotore (se in lista):
+  ON su: lancio prodotti/servizi/funzionalità; campagne/promozioni/offerte; inviti a eventi/webinar/conferenze; proposte di investimento o crescita aziendale.
+  OFF su: contenuti puramente informativi/analitici senza CTA; critica diretta a concorrenti; crisi/tragedie/alta sensibilità sociale; promesse irrealistiche o fuorvianti.
+- Politica, business, tech, scienza, attualità: toni punchy ON (salvo regole OFF sopra).
 
 OUTPUT JSON RIGIDO conforme allo schema.`;
 
   console.log('🧠 F1: Shaper & Gatekeeper...');
+  console.log(`🎛️ Toni company da valutare: ${tonesList}`);
 
-  // callGeminiJson sostituisce fetch() diretto: gestisce timeout, retry e parsing sicuro
-  // topic passato a normalize → gatekeeper toni corregge falsi OFF di Gemini
+  // callGeminiJson: timeout, retry e parsing sicuro
   const parsed = normalizeShaperOutput(
     await callGeminiJson({
-    url: getApiUrl(API_KEY.trim()),
-    step: 'F1',
-    body: {
-      contents: [{ parts: [{ text: promptText }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SHAPER_SCHEMA,
+      url: getApiUrl(API_KEY.trim()),
+      step: 'F1',
+      body: {
+        contents: [{ parts: [{ text: promptText }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: buildShaperSchema(enabledTones),
+        },
       },
-    },
     }),
     topic,
+    { enabledTones },
   );
   const { diagnosi, plan = [], search_required, tone_suitability } = parsed;
 
   // Log toni finali (dopo gatekeeper) per debug UI/switch
-  const tonesSummary = TONE_IDS.map(
-    (id) => `${id}=${tone_suitability?.[id]?.status || 'OFF'}`,
-  ).join(', ');
+  const tonesSummary = enabledTones
+    .map((id) => `${id}=${tone_suitability?.[id]?.status || 'OFF'}`)
+    .join(', ');
   console.log(`🎛️ Toni finali: ${tonesSummary}`);
 
   // Log diagnosi per debug in console

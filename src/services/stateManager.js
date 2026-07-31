@@ -22,7 +22,7 @@ import { isUrlInput } from './contentIngest.js';
 // Riesportiamo isTerminalJobStatus così il worker può usarlo senza import doppio
 export { isTerminalJobStatus };
 
-// Lista dei 6 toni editoriali supportati da PRISM
+// Lista dei toni editoriali supportati da PRISM (catalogo prodotto)
 export const TONE_IDS = [
   'provocatore',
   'confidente',
@@ -30,6 +30,7 @@ export const TONE_IDS = [
   'visionario',
   'metodologico',
   'narratore',
+  'promotore',
 ];
 
 const REDIS_TTL = 86400; // job in Redis scadono dopo 24 ore se non consolidati
@@ -140,9 +141,9 @@ export const mapDateFieldsDeep = (input, convert) => {
 };
 
 /** Crea struttura toni vuota: tutti OFF, testo vuoto, versione 0 */
-export const buildEmptyTones = () => {
+export const buildEmptyTones = (toneIds = TONE_IDS) => {
   const tones = {};
-  for (const id of TONE_IDS) {
+  for (const id of toneIds) {
     tones[id] = {
       status: 'OFF',
       lock_reason: '',
@@ -168,11 +169,20 @@ const TONE_ALIASES = {
   il_metodologico: 'metodologico',
   narratore: 'narratore',
   il_narratore: 'narratore',
+  promotore: 'promotore',
+  il_promotore: 'promotore',
 };
 
 /** Converte l'output toni dello Shaper (F1) nella struttura usata dal worker e Firestore */
-export const buildTonesFromSuitability = (toneSuitability = {}) => {
-  const tones = buildEmptyTones();
+export const buildTonesFromSuitability = (toneSuitability = {}, enabledToneIds = null) => {
+  // Se F1 ha già filtrato per company, usa quelle chiavi; altrimenti catalogo pieno
+  const ids =
+    Array.isArray(enabledToneIds) && enabledToneIds.length > 0
+      ? enabledToneIds
+      : Object.keys(toneSuitability).length > 0
+        ? Object.keys(toneSuitability)
+        : TONE_IDS;
+  const tones = buildEmptyTones(ids);
   for (const [rawKey, val] of Object.entries(toneSuitability)) {
     const key = TONE_ALIASES[rawKey.toLowerCase().replace(/\s+/g, '_')] || rawKey.toLowerCase();
     if (!tones[key]) continue;

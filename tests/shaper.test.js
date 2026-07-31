@@ -45,6 +45,7 @@ describe('Shaper — normalizeShaperOutput', () => {
     visionario: { status: 'ON', lock_reason: '' },
     metodologico: { status: 'ON', lock_reason: '' },
     narratore: { status: 'ON', lock_reason: '' },
+    promotore: { status: 'ON', lock_reason: '' },
   });
 
   test('tutti pilastri OK → search_required false e plan vuoto', () => {
@@ -109,6 +110,7 @@ describe('Shaper — normalizeShaperOutput', () => {
           visionario: { status: 'ON' },
           metodologico: { status: 'ON' },
           narratore: { status: 'ON' },
+          promotore: { status: 'ON' },
         },
         plan: [],
       },
@@ -118,6 +120,8 @@ describe('Shaper — normalizeShaperOutput', () => {
     assert.equal(out.tone_suitability.provocatore.status, 'ON');
     assert.equal(out.tone_suitability.sferzante.status, 'ON');
     assert.equal(out.tone_suitability.confidente.status, 'ON');
+    // Trend analitico senza CTA → promotore OFF
+    assert.equal(out.tone_suitability.promotore.status, 'OFF');
   });
 
   test('topic politico: provocatore e sferzante ON anche se Gemini spegne', () => {
@@ -134,6 +138,7 @@ describe('Shaper — normalizeShaperOutput', () => {
           visionario: { status: 'ON', lock_reason: '' },
           metodologico: { status: 'ON', lock_reason: '' },
           narratore: { status: 'ON', lock_reason: '' },
+          promotore: { status: 'ON', lock_reason: '' },
         },
         plan: [],
       },
@@ -142,13 +147,42 @@ describe('Shaper — normalizeShaperOutput', () => {
     assert.equal(out.tone_suitability.provocatore.status, 'ON');
     assert.equal(out.tone_suitability.sferzante.status, 'ON');
   });
+
+  test('enabledTones filtra tone_suitability alla sola lista company', () => {
+    const out = normalizeShaperOutput(
+      {
+        is_blocked: false,
+        block_message: '',
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+        search_required: false,
+        tone_suitability: baseTones(),
+        plan: [],
+      },
+      'Lancio nuovo prodotto SaaS e campagna webinar 2026',
+      { enabledTones: ['promotore', 'confidente', 'narratore'] },
+    );
+    assert.deepEqual(Object.keys(out.tone_suitability).sort(), [
+      'confidente',
+      'narratore',
+      'promotore',
+    ]);
+    assert.equal(out.tone_suitability.promotore.status, 'ON');
+    assert.equal(out.tone_suitability.provocatore, undefined);
+  });
 });
 
 describe('Shaper — normalizeToneSuitability', () => {
-  test('restituisce sempre le 6 chiavi tono', () => {
+  test('restituisce le chiavi tono richieste (catalogo o subset)', () => {
     const out = normalizeToneSuitability({ confidente: { status: 'ON' } });
-    assert.equal(Object.keys(out).length, 6);
+    assert.equal(Object.keys(out).length, 7);
     assert.equal(out.confidente.status, 'ON');
     assert.equal(out.provocatore.status, 'OFF');
+    assert.ok(out.promotore);
+
+    const subset = normalizeToneSuitability(
+      { promotore: { status: 'ON' }, confidente: { status: 'ON' } },
+      ['promotore', 'confidente'],
+    );
+    assert.deepEqual(Object.keys(subset).sort(), ['confidente', 'promotore']);
   });
 });
