@@ -214,15 +214,15 @@ OUTPUT JSON RIGIDO conforme allo schema.`;
   // topic passato a normalize → gatekeeper toni corregge falsi OFF di Gemini
   const parsed = normalizeShaperOutput(
     await callGeminiJson({
-      url: getApiUrl(API_KEY.trim()),
-      step: 'F1',
-      body: {
-        contents: [{ parts: [{ text: promptText }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema: SHAPER_SCHEMA,
-        },
+    url: getApiUrl(API_KEY.trim()),
+    step: 'F1',
+    body: {
+      contents: [{ parts: [{ text: promptText }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: SHAPER_SCHEMA,
       },
+    },
     }),
     topic,
   );

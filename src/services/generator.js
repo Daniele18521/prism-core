@@ -168,8 +168,8 @@ GENERA L'OUTPUT RISPETTANDO I DELIMITATORI <<< >>>. NON AGGIUNGERE ALTRO PRIMA O
  * Genera il testo di UN solo tono (quello passato in input).
  *
  * BYPASS_DATA_CUTTING:
- * - se input.bypassDataCutting è boolean → usa quello
- * - altrimenti SCENARIO OK → TRUE, GAP → FALSE
+ * - TRUE  se search_required=false (dati già forniti dall'utente → non tagliare)
+ * - FALSE se search_required=true  (dati da search → poche Hero Metrics, resto in regen)
  *
  * @param {object} input — toneKey/tono obbligatorio, platform, language, topic,
  *   instructions, previousContent, bypassDataCutting, shaping

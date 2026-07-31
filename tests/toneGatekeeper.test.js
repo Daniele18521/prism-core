@@ -42,6 +42,17 @@ describe('toneGatekeeper — classifyTopicForTones', () => {
     const flags = classifyTopicForTones('Crisi umanitaria e campi profughi dopo la guerra civile');
     assert.equal(flags.isHumanitarian, true);
   });
+
+  test('guerra + bambini sfollati → umanitario (anche senza “crisi umanitaria”)', () => {
+    const flags = classifyTopicForTones('Impatto della guerra sui bambini sfollati');
+    assert.equal(flags.isHumanitarian, true);
+    assert.equal(flags.isSolemn, false);
+  });
+
+  test('guerra dei prezzi → non umanitario', () => {
+    const flags = classifyTopicForTones('Guerra dei prezzi nel retail e sconti 2026');
+    assert.equal(flags.isHumanitarian, false);
+  });
 });
 
 describe('toneGatekeeper — enforceToneSuitability', () => {
@@ -92,6 +103,22 @@ describe('toneGatekeeper — enforceToneSuitability', () => {
     assert.equal(out.sferzante.status, 'OFF');
     assert.equal(out.sferzante.lock_reason, LOCK_REASONS.sferzante);
     assert.equal(out.confidente.status, 'ON');
+  });
+
+  test('bambini sfollati in guerra: Gemini ON → gatekeeper spegne punchy', () => {
+    const topic = 'Impatto della guerra sui bambini sfollati';
+    const out = enforceToneSuitability(topic, {
+      provocatore: { status: 'ON', lock_reason: '' },
+      confidente: { status: 'ON', lock_reason: '' },
+      sferzante: { status: 'ON', lock_reason: '' },
+      visionario: { status: 'ON', lock_reason: '' },
+      metodologico: { status: 'ON', lock_reason: '' },
+      narratore: { status: 'ON', lock_reason: '' },
+    });
+    assert.equal(out.provocatore.status, 'OFF');
+    assert.equal(out.sferzante.status, 'OFF');
+    assert.equal(out.confidente.status, 'ON');
+    assert.equal(out.narratore.status, 'ON');
   });
 
   test('business generico → tutti ON anche se Gemini spegne', () => {

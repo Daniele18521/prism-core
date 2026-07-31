@@ -164,13 +164,20 @@ export const loadComposedPromptFromFirestore = async ({ toneKey, platform }) => 
 };
 
 /**
- * True se lo Shaper ha segnato SCENARIO come OK (niente GAP) → BYPASS_DATA_CUTTING=TRUE.
+ * BYPASS_DATA_CUTTING — regola prodotto PRISM:
+ *
+ * TRUE  → l'utente ha già fornito i dati (nessuna search F2: search_required=false).
+ *         Prima generazione: NON tagliare metriche/fatti; usare tutto lo SCENARIO.
+ * FALSE → i dati arrivano (anche in parte) dalla search F2 (search_required=true).
+ *         Prima generazione: usare solo poche Hero Metrics; lasciare il resto
+ *         per le rigenerazioni successive (più leva all'utente).
+ *
  * @param {object} [shaping] — job.shaping da Redis/Firestore
  * @returns {boolean}
  */
 export const resolveBypassDataCutting = (shaping) => {
-  const scenario = String(shaping?.diagnosi?.scenario ?? '').trim().toUpperCase();
-  return scenario === 'OK';
+  // Solo se esplicitamente false: input completo, niente taglio
+  return shaping?.search_required === false;
 };
 
 /**

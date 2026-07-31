@@ -91,21 +91,40 @@ const SOLEMN_PATTERNS = [
   /\bdisastro (aereo|naturale|ferroviario)\b/,
 ];
 
-/** Violenza / umanitario → spegne solo sferzante */
+/**
+ * Violenza / umanitario / guerra su civili → spegne provocatore e sferzante.
+ * Include sfollati/rifugiati e “guerra + bambini/civili” (non solo “guerra civile”).
+ * Esclude metafore tipo “guerra dei prezzi” (vedi classifyTopicForTones).
+ */
 const HUMANITARIAN_PATTERNS = [
   /\bgenocidio\b/,
   /\bcrimini? di guerra\b/,
   /\bguerra civile\b/,
+  /\bconflitto armato\b/,
   /\bcarestia\b/,
   /\bcampi? (profughi|rifugiati)\b/,
   /\bcrisi umanitaria\b/,
+  /\bumanitari[ao]\b/,
   /\bviolenza sessuale\b/,
   /\bstupr[oi]\b/,
   /\btortur[ae]\b/,
-  /\bbambini (uccisi|morti|feriti)\b/,
-  /\bcivili (uccisi|morti|bombardat)/,
+  /\bbambini (uccisi|morti|feriti|sfollat)/,
+  /\bcivili (uccisi|morti|bombardat|sfollat)/,
   /\bpulizia etnica\b/,
   /\besodo (di|dei) rifugiat/,
+  /\bsfollat/,
+  /\brifugiat/,
+  /\bprofugh/,
+  // guerra/conflitto legato a civili, minori, sfollamento (non metafora commerciale)
+  /\bguerra\b.{0,60}\b(bambin|civili|sfollat|rifugiat|profugh|vittime|bombard)/,
+  /\b(bambin|civili|sfollat|rifugiat|profugh|vittime)\b.{0,60}\bguerra\b/,
+  /\bimpatto (della|di una|di) guerra\b/,
+];
+
+/** Metafore di “guerra” non umanitarie → non spegnere i toni punchy */
+const COMMERCIAL_WAR_PATTERNS = [
+  /\bguerra (dei prezzi|commerciale|di marketing|al talento|dei talenti)\b/,
+  /\bprice war\b/,
 ];
 
 /** Tema puramente storico → spegne visionario */
@@ -170,7 +189,9 @@ export const classifyTopicForTones = (topic) => {
   const text = norm(topic);
   const isPolitical = anyMatch(text, POLITICAL_PATTERNS);
   const isSolemn = anyMatch(text, SOLEMN_PATTERNS);
-  const isHumanitarian = anyMatch(text, HUMANITARIAN_PATTERNS);
+  // Segnale umanitario, ma non se “guerra” è solo metafora commerciale
+  const isHumanitarian =
+    anyMatch(text, HUMANITARIAN_PATTERNS) && !anyMatch(text, COMMERCIAL_WAR_PATTERNS);
   const looksHistorical = anyMatch(text, HISTORICAL_PATTERNS);
   const hasFutureLink = anyMatch(text, FUTURE_LINK_PATTERNS);
   const looksAbstract = anyMatch(text, ABSTRACT_PATTERNS);

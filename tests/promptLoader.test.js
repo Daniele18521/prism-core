@@ -20,10 +20,27 @@ describe('promptLoader — helpers', () => {
     assert.equal(platformToDocId(''), 'linkedin');
   });
 
-  test('BYPASS_DATA_CUTTING true solo se SCENARIO=OK', () => {
-    assert.equal(resolveBypassDataCutting({ diagnosi: { scenario: 'OK' } }), true);
-    assert.equal(resolveBypassDataCutting({ diagnosi: { scenario: 'GAP' } }), false);
-    assert.equal(resolveBypassDataCutting({ diagnosi: { scenario: 'ok' } }), true);
+  test('BYPASS_DATA_CUTTING true solo se search_required=false (input utente completo)', () => {
+    // Nessuna search → non tagliare i dati in prima generazione
+    assert.equal(resolveBypassDataCutting({ search_required: false }), true);
+    // Search fatta (o da fare) → taglio selettivo, resto in regen
+    assert.equal(resolveBypassDataCutting({ search_required: true }), false);
+    // Scenario OK ma search su altri pilastri → comunque FALSE
+    assert.equal(
+      resolveBypassDataCutting({
+        search_required: true,
+        diagnosi: { scenario: 'OK', context: 'GAP', sfide_opportunita: 'GAP' },
+      }),
+      false,
+    );
+    // Tutti OK → search_required false → TRUE
+    assert.equal(
+      resolveBypassDataCutting({
+        search_required: false,
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+      }),
+      true,
+    );
     assert.equal(resolveBypassDataCutting({}), false);
     assert.equal(resolveBypassDataCutting(null), false);
   });

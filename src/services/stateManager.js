@@ -2,17 +2,18 @@
  * STATE MANAGER — gestisce dove vivono i dati del job durante e dopo l'elaborazione.
  *
  * Due "posti" per i dati:
- * - REDIS = memoria veloce, temporanea (mentre il worker lavora)
- * - FIRESTORE = database permanente (quando il job è finito)
+ * - REDIS = memoria veloce, temporanea (mentre il worker lavora) — date in ISO string
+ * - FIRESTORE = database permanente (quando il job è finito) — date in Timestamp nativo
  *
  * Flusso tipico:
  * 1. API crea job in Redis (initializeRedisJob)
  * 2. Worker aggiorna Redis ad ogni fase (writeContentIngest, writeShaping, writeTavily, writeRefiner...)
- * 3. A fine job → consolidateToFirestore copia tutto su Firestore e cancella Redis
+ * 3. A fine job → consolidateToFirestore copia tutto su Firestore (date → Timestamp) e cancella Redis
  */
 
 import redisConnection from '../utils/redis.js';
-import { db } from '../utils/firebaseAdmin.js';
+// Timestamp nativo Firestore per query range; Redis resta su ISO string
+import { db, Timestamp } from '../utils/firebaseAdmin.js';
 // Utility errori: log strutturato + stati terminali job
 import { isTerminalJobStatus, logError } from '../utils/errors.js';
 // Rileva URL in input per impostare lo step iniziale F0 (content_ingest)
@@ -34,6 +35,9 @@ export const TONE_IDS = [
 const REDIS_TTL = 86400; // job in Redis scadono dopo 24 ore se non consolidati
 const MAX_INSTRUCTIONS_LENGTH = 100; // limite caratteri istruzioni rigenerazione tono
 
+/** Chiavi data: su Firestore → Timestamp; su Redis/API → ISO string */
+const DATE_KEYS = new Set(['createdAt', 'updatedAt', 'extractedAt', 'retrievedAt']);
+
 /** Normalizza nome piattaforma (es. "linkedin" → "LinkedIn") per coerenza in DB */
 export const normalizePlatform = (platform) => {
   const map = {
@@ -46,8 +50,94 @@ export const normalizePlatform = (platform) => {
   return map[(platform || 'general').toLowerCase().trim()] || platform;
 };
 
-const nowIso = () => new Date().toISOString(); // timestamp ISO per createdAt/updatedAt
+/** ISO string per Redis/JSON (il job in elaborazione non può tenere Timestamp) */
+const nowIso = () => new Date().toISOString();
+/** Timestamp Firestore “adesso” per scritture dirette su contents */
+const nowFs = () => Timestamp.now();
 const redisKey = (userId, jobId) => `${userId}:jobs:${jobId}`; // chiave univoca job in Redis
+
+/**
+ * Converte un valore data in Timestamp Firestore (scrittura DB permanente).
+ * Accetta ISO string, Date, millis, Timestamp già pronto; null resta null.
+ */
+export const toFirestoreTimestamp = (value) => {
+  if (value == null || value === '') return null;
+  if (value instanceof Timestamp) return value;
+  // Oggetto Timestamp serializzato da SDK (toDate/toMillis)
+  if (typeof value?.toDate === 'function' && typeof value?.toMillis === 'function') {
+    return value instanceof Timestamp ? value : Timestamp.fromMillis(value.toMillis());
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : Timestamp.fromDate(value);
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Timestamp.fromMillis(value);
+  }
+  if (typeof value === 'string') {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : Timestamp.fromDate(d);
+  }
+  return null;
+};
+
+/**
+ * Converte Timestamp (o Date) in ISO string per Redis e risposte API.
+ * Se è già stringa, la lascia com’è.
+ */
+export const toIsoString = (value) => {
+  if (value == null || value === '') return null;
+  if (typeof value === 'string') return value;
+  if (typeof value?.toDate === 'function') {
+    try {
+      return value.toDate().toISOString();
+    } catch {
+      return null;
+    }
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+  return null;
+};
+
+/** True se sembra un Timestamp Firestore (anche da snap.data()) */
+const isFirestoreTimestamp = (value) =>
+  value instanceof Timestamp ||
+  (value &&
+    typeof value === 'object' &&
+    typeof value.toDate === 'function' &&
+    typeof value.toMillis === 'function');
+
+/**
+ * Percorre l’oggetto e converte solo le chiavi data note (createdAt, updatedAt, …).
+ * @param {*} input
+ * @param {(v: *) => *} convert — toFirestoreTimestamp oppure toIsoString
+ */
+export const mapDateFieldsDeep = (input, convert) => {
+  if (Array.isArray(input)) {
+    return input.map((item) => mapDateFieldsDeep(item, convert));
+  }
+  if (isFirestoreTimestamp(input)) {
+    return convert(input);
+  }
+  if (input && typeof input === 'object') {
+    const out = {};
+    for (const [key, val] of Object.entries(input)) {
+      if (DATE_KEYS.has(key)) {
+        out[key] = convert(val);
+      } else if (val && typeof val === 'object') {
+        out[key] = mapDateFieldsDeep(val, convert);
+      } else {
+        out[key] = val;
+      }
+    }
+    return out;
+  }
+  return input;
+};
 
 /** Crea struttura toni vuota: tutti OFF, testo vuoto, versione 0 */
 export const buildEmptyTones = () => {
@@ -291,10 +381,13 @@ export const setJobError = async (userId, jobId, message, step) => {
   });
 };
 
-/** Trasforma il job Redis nel formato documento Firestore (collection: contents) */
+/**
+ * Trasforma il job Redis nel formato documento Firestore (collection: contents).
+ * Tutte le chiavi data diventano Timestamp nativi (query range <= / >=).
+ */
 const buildFirestorePayload = (job, finalStatus) => {
-  const timestamp = nowIso();
-  return {
+  const timestamp = nowIso(); // ancora ISO in bozza; conversione sotto
+  const payload = {
     jobId: job.jobId,
     companyId: job.companyId,
     userId: job.userId,
@@ -323,6 +416,8 @@ const buildFirestorePayload = (job, finalStatus) => {
     tones: job.tones,
     error: job.error?.message ? job.error : null,
   };
+  // ISO (e nested extractedAt/retrievedAt) → Timestamp prima del .set
+  return mapDateFieldsDeep(payload, toFirestoreTimestamp);
 };
 
 /**
@@ -380,12 +475,13 @@ export const failAndConsolidate = async (userId, jobId, message, step, status = 
   }
 
   try {
+    // Fallback diretto su FS: anche qui Timestamp, non ISO string
     await db.collection('contents').doc(jobId).set({
       jobId,
       userId,
       status,
       error: { message, step },
-      updatedAt: nowIso(),
+      updatedAt: nowFs(),
     }, { merge: true });
     await deleteRedisJob(userId, jobId).catch(() => {});
     return { persisted: true, source: 'firestore' };
@@ -395,10 +491,14 @@ export const failAndConsolidate = async (userId, jobId, message, step, status = 
   }
 };
 
-/** Legge un job già consolidato da Firestore (dopo che Redis è stato cancellato) */
+/**
+ * Legge un job già consolidato da Firestore (dopo che Redis è stato cancellato).
+ * Converte Timestamp → ISO così Redis/API restano serializzabili in JSON.
+ */
 export const getFirestoreJob = async (jobId) => {
   const snap = await db.collection('contents').doc(jobId).get();
-  return snap.exists ? snap.data() : null;
+  if (!snap.exists) return null;
+  return mapDateFieldsDeep(snap.data(), toIsoString);
 };
 
 /**
@@ -512,7 +612,7 @@ export const updateToneTextOnFirestore = async (jobId, toneKey, text) => {
 
   await db.collection('contents').doc(jobId).set({
     [`tones.${toneKey}`]: tone,
-    updatedAt: nowIso(),
+    updatedAt: nowFs(),
   }, { merge: true });
 };
 

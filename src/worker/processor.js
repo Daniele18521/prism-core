@@ -50,7 +50,7 @@ import { refineResults } from '../services/refiner.js';
 import { generateTones } from '../services/generator.js';
 // Verifica companies.enabled_tones
 import { assertToneEnabledForCompany } from '../services/companyAccess.js';
-// BYPASS_DATA_CUTTING da diagnosi Shaper (SCENARIO OK → true)
+// BYPASS_DATA_CUTTING: TRUE solo se search_required=false (input utente completo)
 import { resolveBypassDataCutting } from '../services/promptLoader.js';
 
 dotenv.config();
@@ -336,7 +336,7 @@ const runToneGeneration = async ({
   });
 
   const refiner = state.refiner || {};
-  // TRUE se Shaper ha messo SCENARIO=OK
+  // TRUE se search_required=false (dati utente completi → non tagliare in Desire)
   const bypassDataCutting = resolveBypassDataCutting(state.shaping);
   // Baseline strutturale: request o testo già presente
   const prevContent =
