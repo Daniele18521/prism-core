@@ -43,9 +43,13 @@ const DATE_KEYS = new Set(['createdAt', 'updatedAt', 'extractedAt', 'retrievedAt
 export const normalizePlatform = (platform) => {
   const map = {
     linkedin: 'LinkedIn',
+    instagram: 'Instagram',
+    ig: 'Instagram',
     facebook: 'Facebook',
     x: 'X',
     twitter: 'X',
+    carosello: 'Carosello',
+    carousel: 'Carosello',
     general: 'LinkedIn',
   };
   return map[(platform || 'general').toLowerCase().trim()] || platform;
@@ -217,6 +221,7 @@ export const initializeRedisJob = async (userId, jobId, {
   topic,
   platform = 'general',
   language = 'italiano',
+  outputFormat = 'text',
   action,
 }) => {
   const timestamp = nowIso();
@@ -236,6 +241,7 @@ export const initializeRedisJob = async (userId, jobId, {
     status: inputType === 'url' ? 'ingesting' : 'pending',
     language,
     platform: normalizePlatform(platform),
+    outputFormat: String(outputFormat || 'text').toLowerCase().trim() || 'text',
     action: action || 'standard',
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -408,6 +414,7 @@ const buildFirestorePayload = (job, finalStatus) => {
     status: finalStatus,
     language: job.language,
     platform: job.platform,
+    outputFormat: job.outputFormat || 'text',
     action: job.action,
     createdAt: job.createdAt || timestamp,
     updatedAt: timestamp,
@@ -530,6 +537,7 @@ export const hydrateRedisFromFirestore = async (userId, jobId) => {
     status: fs.status,
     language: fs.language,
     platform: fs.platform,
+    outputFormat: fs.outputFormat || 'text',
     action: fs.action || 'standard',
     createdAt: fs.createdAt,
     updatedAt: nowIso(),
@@ -578,6 +586,7 @@ export const getJobStatusForClient = async (userId, jobId) => {
     sourceMeta: job.sourceMeta || null,
     platform: normalizePlatform(job.platform),
     language: job.language,
+    outputFormat: job.outputFormat || 'text',
     action: job.action,
     workerState: {
       ...workerState,

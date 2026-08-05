@@ -27,13 +27,15 @@ const PIATTAFORMA_SUBCOLLECTION = 'piattaforma';
  * Chiave documento piattaforma in Firestore (minuscolo).
  * Accetta sia "LinkedIn" (normalizzato PRISM) sia "linkedin".
  * @param {string} platform
- * @returns {'facebook'|'linkedin'|'x'}
+ * @returns {'facebook'|'linkedin'|'instagram'|'x'|'carosello'}
  */
 export const platformToDocId = (platform) => {
   const raw = String(platform ?? '')
     .toLowerCase()
     .trim();
   if (raw === 'facebook' || raw === 'fb') return 'facebook';
+  if (raw === 'instagram' || raw === 'ig') return 'instagram';
+  if (raw === 'carosello' || raw === 'carousel') return 'carosello';
   if (raw === 'x' || raw === 'twitter') return 'x';
   // default LinkedIn (come normalizePlatform)
   return 'linkedin';
@@ -205,6 +207,7 @@ export const buildInputVariablesBlock = (vars) => {
     '[[ VARIABILI DI INPUT ]]',
     `LINGUA_OUTPUT: ${vars.LINGUA_OUTPUT ?? ''}`,
     `PIATTAFORMA: ${vars.PIATTAFORMA ?? ''}`,
+    `FORMATO_OUTPUT: ${vars.FORMATO_OUTPUT ?? 'text'}`,
     `TONO: ${vars.TONO ?? ''}`,
     `BYPASS_DATA_CUTTING: ${vars.BYPASS_DATA_CUTTING ? 'TRUE' : 'FALSE'}`,
     `ISTRUZIONI_AGGIUNTIVE: ${vars.ISTRUZIONI_AGGIUNTIVE ?? ''}`,

@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prism.local/schemas/carousel-spec.schema.json",
+  "title": "PRISM Carousel Spec",
+  "description": "Schema output piattaforma carosello PRISM",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "platform",
+    "targets",
+    "aspect_ratio",
+    "tone",
+    "language",
+    "topic",
+    "slide_count",
+    "slides",
+    "hashtags"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "platform": {
+      "type": "string",
+      "const": "carosello"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["linkedin", "instagram"]
+      }
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "enum": ["1:1", "4:5"]
+    },
+    "tone": {
+      "type": "string",
+      "minLength": 2
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^[a-z][a-z\\-\\s]{1,30}$"
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 180
+    },
+    "slide_count": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 10
+    },
+    "slides": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/slide"
+      }
+    },
+    "hashtags": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_]{2,40}$"
+      }
+    },
+    "notes_for_design": {
+      "type": "string",
+      "maxLength": 180
+    }
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "label"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "label": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 140
+        },
+        "implication": {
+          "type": "string",
+          "maxLength": 80
+        }
+      }
+    },
+    "slide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "role",
+        "headline",
+        "body",
+        "metric",
+        "visual_hint",
+        "cta",
+        "emphasis"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "hook",
+            "context",
+            "problem",
+            "proof",
+            "method",
+            "desire",
+            "cta"
+          ]
+        },
+        "headline": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 60
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "metric": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/metric" }
+          ]
+        },
+        "visual_hint": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "cta": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "string", "maxLength": 60 }
+          ]
+        },
+        "emphasis": {
+          "type": "string",
+          "enum": ["headline", "metric", "cta"]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "slide_count deve corrispondere alla lunghezza effettiva di slides",
+      "if": {
+        "properties": {
+          "slide_count": { "const": 5 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 5, "maxItems": 5 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "slide_count": { "const": 6 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 6, "maxItems": 6 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "slide_count": { "const": 7 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 7, "maxItems": 7 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "slide_count": { "const": 8 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 8, "maxItems": 8 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "slide_count": { "const": 9 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 9, "maxItems": 9 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "slide_count": { "const": 10 }
+        }
+      },
+      "then": {
+        "properties": {
+          "slides": { "minItems": 10, "maxItems": 10 }
+        }
+      }
+    }
+  ]
+}

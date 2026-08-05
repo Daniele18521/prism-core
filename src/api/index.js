@@ -75,6 +75,7 @@ const enqueueAnalysisJob = async (jobId, payload, queueOpts) => {
     topic: payload.topic,
     platform: payload.platform || 'general',
     language: payload.language || 'italiano',
+    outputFormat: payload.outputFormat || 'text',
     action: 'shaping_only', // sempre analisi F0→F3, mai F4
   });
 
@@ -114,11 +115,11 @@ app.get('/ready', async (_req, res) => {
  * Avvia l'analisi editoriale: F0 (URL) → F1 Shaper → F2 Search → F3 Refiner.
  * NON genera testi dei toni: quello lo fa regenerate-tone-surgical.
  *
- * Body: { userId, companyId, topic, platform?, language? }
+ * Body: { userId, companyId, topic, platform?, language?, outputFormat? }
  * Risposta: { success, jobId } → poi polling su /jobs/status
  */
 app.post('/api/prepare-shaping', async (req, res) => {
-  const { userId, companyId, topic, platform, language } = req.body;
+  const { userId, companyId, topic, platform, language, outputFormat, formatoOutput } = req.body;
   // Parametri minimi obbligatori
   if (!userId || !topic || !companyId) {
     return res.status(400).json({ error: 'Missing userId, companyId or topic' });
@@ -136,6 +137,7 @@ app.post('/api/prepare-shaping', async (req, res) => {
         topic,
         platform,
         language: language || 'italiano',
+        outputFormat: outputFormat || formatoOutput || 'text',
         action: 'shaping_only',
       },
       {
@@ -197,6 +199,7 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
     const toneKey = normalizeToneKey(body.tono || body.toneKey);
     const language = body.linguaOutput || body.lingua || body.language;
     const platform = body.piattaforma || body.platform;
+    const outputFormat = body.formatoOutput || body.outputFormat || body.format || 'text';
     const topic = body.argomento || body.topic;
     // Prima generazione: istruzioni/contenuto precedente opzionali (usati in altro flusso di regen)
     const instructionsRaw = body.istruzioniAggiuntive || body.istruzioni || body.instructions || '';
@@ -266,6 +269,7 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
     const regenJobId = randomUUID();
     const resolvedPlatform = normalizePlatform(platform);
     const resolvedLanguage = String(language).trim();
+    const resolvedOutputFormat = String(outputFormat || 'text').trim().toLowerCase();
     const resolvedTopic = topic || job.topic || '';
 
     // Accoda SOLO la generazione del tono (action regen_tone)
@@ -277,6 +281,7 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
         toneKey,
         platform: resolvedPlatform,
         language: resolvedLanguage,
+        outputFormat: resolvedOutputFormat,
         topic: resolvedTopic,
         instructions: regenInstructions,
         previousContent: previous,
@@ -302,6 +307,7 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
       },
       platform: resolvedPlatform,
       language: resolvedLanguage,
+      outputFormat: resolvedOutputFormat,
     });
 
     // Attende il worker e restituisce subito il contenuto (o l'errore)
@@ -315,6 +321,19 @@ app.post('/api/regenerate-tone-surgical', async (req, res) => {
           contenutoGenerato: null,
           jobId,
         });
+      }
+      // Guardrail API: se formato carosello, assicura almeno JSON parsabile prima della risposta.
+      if (resolvedOutputFormat === 'carousel' || resolvedOutputFormat === 'carosello') {
+        try {
+          JSON.parse(String(contenutoGenerato));
+        } catch {
+          return res.status(500).json({
+            success: false,
+            error: 'Output carosello non valido: JSON non parsabile.',
+            contenutoGenerato: null,
+            jobId,
+          });
+        }
       }
       return res.json({
         success: true,

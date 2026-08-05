@@ -48,7 +48,7 @@ import { performWebSearch } from '../services/search.js';
 // F3: pilastri SCENARIO / CONTESTO / SFIDE_OPPORTUNITA
 import { refineResults } from '../services/refiner.js';
 // F4: generazione di UN tono (solo path regen_tone)
-import { generateTones } from '../services/generator.js';
+import { generateTones, validateCarouselOutputText } from '../services/generator.js';
 // Verifica companies.enabled_tones + lista toni per F1
 import {
   assertToneEnabledForCompany,
@@ -322,6 +322,7 @@ const runToneGeneration = async ({
   topic,
   platform,
   language,
+  outputFormat,
   maxChars,
   instructions,
   previousContent,
@@ -370,6 +371,7 @@ const runToneGeneration = async ({
       topic: topic || state.topic,
       platform: normalizePlatform(platform || state.platform),
       language: language || state.language,
+      outputFormat: outputFormat || state.outputFormat || 'text',
       maxChars,
       toneKey,
       instructions: instructions || '',
@@ -380,11 +382,26 @@ const runToneGeneration = async ({
     refiner.compressedFacts || [],
   );
 
-  const newText = output?.text;
+  let newText = output?.text;
   if (!newText) {
     throw new AppError(`Generazione fallita per tono: ${toneKey}`, {
       step: 'generation',
       retryable: true,
+    });
+  }
+
+  // Guardrail extra: prima di persistere, il carosello deve restare JSON valido schema.
+  const resolvedOutputFormat = String(outputFormat || state.outputFormat || 'text').toLowerCase();
+  if (resolvedOutputFormat === 'carousel' || resolvedOutputFormat === 'carosello') {
+    const expectedTarget =
+      String(normalizePlatform(platform || state.platform)).toLowerCase() === 'instagram'
+        ? 'instagram'
+        : 'linkedin';
+    const expectedLanguage = String(language || state.language || 'italiano').trim().toLowerCase();
+    newText = validateCarouselOutputText(newText, {
+      expectedTone: toneKey,
+      expectedLanguage,
+      expectedTarget,
     });
   }
 
@@ -416,6 +433,7 @@ const worker = new Worker(
       topic,
       platform,
       language,
+      outputFormat,
       maxChars,
       toneKey,
       action,
@@ -455,6 +473,7 @@ const worker = new Worker(
           topic,
           platform,
           language,
+          outputFormat,
           maxChars,
           instructions,
           previousContent,
