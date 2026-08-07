@@ -10,11 +10,13 @@ Presuppone che §1 STRUTTURA COMUNE resti valida: **HOOK riga 1 + riga 2 vuota**
 | [TONO] | Layout |
 |---|---|
 | promotore, sferzante, provocatore, visionario | **V** — Verticale LinkedIn (executive, mobile-first) |
+| informatore | **I** — Informatore moderno (fattuale, scansionabile, non commerciale) |
 | confidente, narratore, narrativo | **C** — Prosa B2B densa |
 | metodologico | **B** — Gabbia logica |
 
 Regole rapide:
 - **V** → respiro verticale, blocchi corti; **no** emoji; **no** Layout A Facebook (niente slang/ghigliottina da feed community).
+- **I** → informatore: prosa fluida scansionabile; zero soft-promo; zero artefatti.
 - **C** → prosa continua a paragrafi; no monorighe come struttura dominante.
 - **B** → step numerati dopo hook + cornice; vietato partire da `1.` senza apertura.
 - Su LinkedIn **nessun tono** usa il Layout A Facebook (emoji, “caffè professionale”, monorighe infinite).
@@ -69,7 +71,39 @@ Differenza da Facebook: stessa aria, meno rumore; zero emoji; lessico profession
 
 ---
 
-## 4. VARIANTE C — Prosa B2B densa (confidente | narratore | narrativo)
+## 4. VARIANTE I — Informatore (LinkedIn)
+
+Allinea la geometria canale al tono informatore (come V/C/B per gli altri toni).
+
+### Geometria HARD
+- Hook riga 1 + riga 2 vuota (§1).
+- Hook = fatto da SCENARIO (sentence case, ≤100 caratteri). OUTPUT FALLITO se teaser/CTA.
+- Corpo: **3–5 paragrafi**, **1–2 frasi**, riga vuota tra paragrafi.
+- Target frase: 12–20 parole.
+- No emoji, no elenchi, no monorighe decorative.
+- Hashtag: **3–4**, minuscolo, termini dai pilastri.
+
+### Mapping contenuto (dal tono)
+Se hook ha già soggetto+tema → corpo parte dai dettagli SCENARIO (luogo/date/punto), senza ripetere l’intero fatto.
+Poi: Contesto denso (`riguarda` + focus/ambiti) → Orientamento descrittivo (SFIDE) → stop.
+
+### BAN canale (OUTPUT FALLITO)
+presidia, collocata, prenderà parte, vetrina, espone, presenta attività, si concentra,
+ambiti di lavoro includono, attività specialistiche, l’attività riguarda, lo scambio si riferisce,
+serve per, permette di, incontra i visitatori per, per approfondire, per valutare,
+ti aspettiamo, prenota, networking strategico, [S], {{
+
+### Verbo CONTESTO
+AMMESSO: `riguarda`, `include`, `con focus su`.
+VIETATO: `espone`, `mette in mostra`, `presenta attività`.
+
+### Override
+Ignora CTA/punchline/storytelling/verticalità aggressiva nel tono.
+Vince Layout I + slice dati attivo.
+
+---
+
+## 5. VARIANTE C — Prosa B2B densa (confidente | narratore | narrativo)
 
 ### Geometria
 - Max **4** paragrafi (dalla riga 3 alla chiusura).
@@ -97,7 +131,7 @@ Segui lo **slice attivo**.
 
 ---
 
-## 5. VARIANTE B — Gabbia logica (metodologico)
+## 6. VARIANTE B — Gabbia logica (metodologico)
 
 ### Geometria HARD
 - OUTPUT FALLITO se manca hook (§1) o se il post inizia con `1.`
@@ -119,11 +153,12 @@ Slice attivo; max 1–2 cluster per step se TRUE; pochi anchor se FALSE.
 
 ---
 
-## 6. OVERRIDE SUL TONO
+## 7. OVERRIDE SUL TONO
 
 | Layout | Ignora nel prompt di tono |
 |---|---|
 | V | “paragrafi densi”, “prosa fluida tradizionale senza a capo”, “max 3 frasi per blocco muro” |
+| I | “CTA”, “invito commerciale”, “verticalità aggressiva”, “punchline”, “storytelling emotivo” |
 | C | “ritmo asimmetrico verticale”, “una riga per dato”, “ghigliottina monorighe”, “C-mobile aggressivo” |
 | B | “prosa discorsiva senza step”, “solo elenco senza hook” |
 
@@ -131,15 +166,17 @@ Se il tono chiede BYPASS/dati: vince lo **slice attivo**; la geometria resta di 
 
 ---
 
-## 7. CHECKLIST PRE-OUTPUT (aggiunte layout)
+## 8. CHECKLIST PRE-OUTPUT (aggiunte layout)
 
 □ Hook riga 1 + riga 2 vuota?
-□ Layout corretto per [TONO] (V / C / B)?
+□ Layout corretto per [TONO] (V / I / C / B)?
 □ Se V: blocchi 1–2 frasi, no emoji, no muro?
+□ Se I: 3–5 paragrafi, 1–2 frasi, document-bound, zero marker/soft-promo?
+□ Se I: hook = fatto (non teaser), hashtag 3–4 specifici?
 □ Se C: prosa densa, non verticale social?
 □ Se B: hook + cornice + step (non parte da 1.)?
 □ Zero emoji LinkedIn?
-□ Hashtag 3–5?
+□ Hashtag 3–4, tecnici e pertinenti (no tag generici)?
 □ Contratto dati dello slice rispettato?
 
 ---

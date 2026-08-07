@@ -31,6 +31,7 @@ export const TONE_IDS = [
   'metodologico',
   'narratore',
   'promotore',
+  'informatore',
 ];
 
 const REDIS_TTL = 86400; // job in Redis scadono dopo 24 ore se non consolidati
@@ -175,6 +176,8 @@ const TONE_ALIASES = {
   il_narratore: 'narratore',
   promotore: 'promotore',
   il_promotore: 'promotore',
+  informatore: 'informatore',
+  l_informatore: 'informatore',
 };
 
 /** Converte l'output toni dello Shaper (F1) nella struttura usata dal worker e Firestore */

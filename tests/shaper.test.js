@@ -9,6 +9,7 @@ import {
   normalizeToneEntry,
   normalizeToneSuitability,
   normalizeShaperOutput,
+  isThinEditorialInput,
 } from '../src/services/shaper.js';
 
 describe('Shaper — normalizeToneEntry', () => {
@@ -37,6 +38,26 @@ describe('Shaper — normalizeToneEntry', () => {
   });
 });
 
+describe('Shaper — isThinEditorialInput', () => {
+  test('domanda/tesi senza fatti → thin', () => {
+    assert.equal(
+      isThinEditorialInput(
+        'perché i motori di AI generalisti sono dei pessimi copywriter per la tua azienda?',
+      ),
+      true,
+    );
+  });
+
+  test('input con evidenze numeriche / corpo sostanziale → non thin', () => {
+    assert.equal(
+      isThinEditorialInput(
+        'Nel 2025 il tasso di adozione è del 37%. Il report indica criticità su qualità e controllo editoriale in azienda.',
+      ),
+      false,
+    );
+  });
+});
+
 describe('Shaper — normalizeShaperOutput', () => {
   const baseTones = () => ({
     provocatore: { status: 'ON', lock_reason: '' },
@@ -46,6 +67,28 @@ describe('Shaper — normalizeShaperOutput', () => {
     metodologico: { status: 'ON', lock_reason: '' },
     narratore: { status: 'ON', lock_reason: '' },
     promotore: { status: 'ON', lock_reason: '' },
+    informatore: { status: 'OFF', lock_reason: '' },
+  });
+
+  test('tesi senza fatti: Gemini OK → forza GAP + search_required', () => {
+    const out = normalizeShaperOutput(
+      {
+        is_blocked: false,
+        block_message: '',
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+        search_required: false,
+        tone_suitability: baseTones(),
+        plan: [],
+      },
+      'perché i motori di AI generalisti sono dei pessimi copywriter per la tua azienda?',
+      { currentYear: 2026, previousYear: 2025 },
+    );
+    assert.equal(out.diagnosi.scenario, 'GAP');
+    assert.equal(out.diagnosi.context, 'GAP');
+    assert.equal(out.diagnosi.sfide_opportunita, 'GAP');
+    assert.equal(out.search_required, true);
+    assert.equal(out.plan.length, 3);
+    assert.ok(out.plan.every((p) => /2026|2025/.test(p.query)));
   });
 
   test('tutti pilastri OK → search_required false e plan vuoto', () => {
@@ -111,6 +154,7 @@ describe('Shaper — normalizeShaperOutput', () => {
           metodologico: { status: 'ON' },
           narratore: { status: 'ON' },
           promotore: { status: 'ON' },
+          informatore: { status: 'OFF' },
         },
         plan: [],
       },
@@ -169,15 +213,35 @@ describe('Shaper — normalizeShaperOutput', () => {
     assert.equal(out.tone_suitability.promotore.status, 'ON');
     assert.equal(out.tone_suitability.provocatore, undefined);
   });
+
+  test('topic evento neutro: informatore ON e override toni non coerenti', () => {
+    const out = normalizeShaperOutput(
+      {
+        is_blocked: false,
+        block_message: '',
+        diagnosi: { scenario: 'OK', context: 'OK', sfide_opportunita: 'OK' },
+        search_required: false,
+        tone_suitability: baseTones(),
+        plan: [],
+      },
+      'Saremo presenti a Coiltech 2026. Ci vediamo a Pordenone allo stand 6-C12.',
+    );
+    assert.equal(out.tone_suitability.informatore.status, 'ON');
+    assert.equal(out.tone_suitability.promotore.status, 'OFF');
+    assert.equal(out.tone_suitability.provocatore.status, 'OFF');
+    assert.equal(out.tone_suitability.visionario.status, 'OFF');
+    assert.equal(out.tone_suitability.narratore.status, 'OFF');
+  });
 });
 
 describe('Shaper — normalizeToneSuitability', () => {
   test('restituisce le chiavi tono richieste (catalogo o subset)', () => {
     const out = normalizeToneSuitability({ confidente: { status: 'ON' } });
-    assert.equal(Object.keys(out).length, 7);
+    assert.equal(Object.keys(out).length, 8);
     assert.equal(out.confidente.status, 'ON');
     assert.equal(out.provocatore.status, 'OFF');
     assert.ok(out.promotore);
+    assert.ok(out.informatore);
 
     const subset = normalizeToneSuitability(
       { promotore: { status: 'ON' }, confidente: { status: 'ON' } },

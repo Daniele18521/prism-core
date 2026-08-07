@@ -94,6 +94,59 @@ const PILLAR_FIELDS = [
 const isGap = (value) => String(value ?? '').trim().toUpperCase() === 'GAP';
 
 /**
+ * Input "sottile": tesi/domanda/titolo senza evidenze già presenti nel testo.
+ * Criteri solo generici (nessun dominio: eventi, tech, PA, ecc.).
+ * In questi casi i pilastri NON possono essere OK: serve ricerca.
+ * @param {string} topic
+ * @returns {boolean}
+ */
+export const isThinEditorialInput = (topic = '') => {
+  const text = String(topic ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return false;
+
+  const words = text.split(' ').filter(Boolean);
+  const lower = text.toLowerCase();
+
+  // Evidenza generica già nell'input: cifre/dati, oppure corpo fattuale abbastanza lungo
+  const hasNumericEvidence = /\d/.test(text);
+  const hasSubstantialBody = words.length >= 55;
+  if (hasNumericEvidence || hasSubstantialBody) return false;
+
+  // Domanda / tesi / titolo corto senza evidenze → GAP obbligatorio
+  const isQuestion = /\?/.test(text) || /^(perch[eé]|come|qual[ei]|cosa|why|how)\b/i.test(lower);
+  const isShort = words.length <= 50;
+  if (isQuestion && isShort) return true;
+  if (words.length <= 18) return true;
+  return false;
+};
+
+/**
+ * Query di fallback per pilastri GAP quando Gemini non ha prodotto un plan utile.
+ * @param {string} topic
+ * @param {string[]} gapLabels
+ * @param {number} year
+ * @param {number} previousYear
+ */
+const buildFallbackGapPlan = (topic, gapLabels, year, previousYear) => {
+  // Riusa l'input così le query restano sul nucleo, non sul dominio-padre
+  const base = String(topic || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+  const templates = {
+    SCENARIO: `${base} evidenze dati fatti ${year}`,
+    CONTESTO: `${base} contesto perché conta ${previousYear} ${year}`,
+    SFIDE_OPPORTUNITA: `${base} criticità rischi opportunità operative ${year}`,
+  };
+  return gapLabels.map((pillar) => ({
+    pillar,
+    query: templates[pillar] || `${base} ${pillar} ${year}`,
+  }));
+};
+
+/**
  * Ripara status/lock_reason quando Gemini li mescola in un unico campo.
  * Es. status: "OFFMotivo..." invece di status:"OFF" + lock_reason:"Motivo..."
  */
@@ -140,27 +193,42 @@ export const normalizeToneSuitability = (toneSuitability = {}, toneIds = TONE_ID
 
 /**
  * Corregge output Shaper quando Gemini ignora le regole:
+ * - OK solo se l'input contiene già fatti solidi (altrimenti GAP + search)
  * - search_required true solo se c'è almeno un GAP
- * - plan vuoto se tutti OK
- * - plan solo per pilastri GAP
+ * - plan vuoto se tutti OK; plan solo per pilastri GAP
  * - toni ON/OFF con gatekeeper + filtro enabled_tones company
  *
  * @param {object} parsed — JSON grezzo da Gemini
  * @param {string} [topic=''] — testo input (topic o estratto F0)
- * @param {{ enabledTones?: string[] }} [opts]
+ * @param {{ enabledTones?: string[], currentYear?: number, previousYear?: number }} [opts]
  */
 export const normalizeShaperOutput = (parsed, topic = '', opts = {}) => {
-  const diagnosi = parsed.diagnosi || {};
+  const diagnosi = { ...(parsed.diagnosi || {}) };
+
+  // Tesi/domanda senza evidenze: Gemini non può "interpretare" OK → forza GAP
+  if (isThinEditorialInput(topic)) {
+    for (const { key } of PILLAR_FIELDS) {
+      diagnosi[key] = 'GAP';
+    }
+  }
+
   const gapPillars = PILLAR_FIELDS.filter(({ key }) => isGap(diagnosi[key]));
   const search_required = gapPillars.length > 0;
 
   let plan = [];
   if (search_required) {
-    const gapLabels = new Set(gapPillars.map(({ label }) => label));
+    const gapLabels = gapPillars.map(({ label }) => label);
+    const gapLabelSet = new Set(gapLabels);
     const rawPlan = Array.isArray(parsed.plan) ? parsed.plan : [];
-    plan = rawPlan.filter(({ pillar }) => gapLabels.has(String(pillar ?? '').trim().toUpperCase()));
+    plan = rawPlan.filter(({ pillar }) => gapLabelSet.has(String(pillar ?? '').trim().toUpperCase()));
     if (plan.length === 0 && rawPlan.length > 0) {
       plan = rawPlan.slice(0, gapPillars.length);
+    }
+    // Se Gemini ha messo OK ovunque (plan vuoto) ma l'input è sottile → query di recupero
+    if (plan.length === 0) {
+      const year = opts.currentYear || new Date().getFullYear();
+      const previousYear = opts.previousYear || year - 1;
+      plan = buildFallbackGapPlan(topic, gapLabels, year, previousYear);
     }
   }
 
@@ -213,12 +281,34 @@ Ogni query generata nel 'plan' deve obbligatoriamente contenere almeno uno di qu
 1. SAFETY CHECK: Se l'input contiene diffamazione, odio, pornografia o violenza, imposta is_blocked: true e un block_message professionale.
 
 2. DIAGNOSI DEI GAP: Valuta i 3 pilastri (SCENARIO, CONTESTO, SFIDE_OPPORTUNITA).
-Se l'input utente li contiene già in modo solido, segna 'OK'.
-Se mancano, segna 'GAP'.
+Regola madre: OK SOLO se l'INPUT UTENTE contiene già informazioni base ESPLICITE per quel pilastro.
+VIETATO segnare OK per interpretazione, parafrasi, tesi, opinione o domanda senza fatti.
+VIETATO "riempire" i pilastri elaborando mentalmente l'argomento: se i fatti non sono nell'input → GAP + ricerca.
+
+Criteri HARD per OK (devono essere presenti nel testo input, non dedotti):
+- SCENARIO OK: fatti concreti già scritti (dati, numeri, eventi/azioni con dettagli espliciti).
+- CONTESTO OK: cornice/background già scritta nell'input.
+- SFIDE_OPPORTUNITA OK: criticità/opportunità/implicazioni già scritte nell'input.
+
+Segna GAP (e quindi ricerca) quando l'input è:
+- una domanda senza corpo fattuale
+- una tesi/opinione senza evidenze
+- un titolo/argomento senza informazioni base
+- un testo da cui potresti solo inventare o generalizzare i pilastri
+
+Esempio di principio (qualsiasi dominio): domanda o tesi corta senza fatti nell'input
+→ tutti i pilastri GAP, search_required=true (serve ricerca di sostegno).
+
 - Se TUTTI i pilastri sono 'OK': search_required DEVE essere false e plan DEVE essere [] (array vuoto, nessuna query).
 - Se almeno un pilastro è 'GAP': search_required DEVE essere true e plan contiene UNA voce per ogni pilastro 'GAP' (mai per quelli 'OK').
 - Ogni voce di plan deve avere pillar uguale esattamente a SCENARIO, CONTESTO o SFIDE_OPPORTUNITA (non titoli descrittivi).
 - Ogni query deve includere l'anno ${currentYear} o ${previousYear}.
+- Ogni query DEVE riusare i termini distintivi dell'INPUT UTENTE (nucleo), non solo la categoria ampia.
+- SCENARIO query: evidenze/fatti sul nucleo dell'input.
+- CONTESTO query: cornice del nucleo (perché conta in quel perimetro).
+- SFIDE_OPPORTUNITA query: criticità/leve operative del nucleo.
+- Vietato allargare a dominio-padre / temi contigui non richiesti dall'input.
+- Non inventare i pilastri: la ricerca serve a colmare i GAP con fatti verticali sull'input.
 
 3. MATRICE DI IDONEITÀ TONI — valuta SOLO questi toni (abilitati per l'azienda): ${tonesList}.
 Per ogni tono imposta un oggetto { "status": "ON"|"OFF", "lock_reason": "..." }.
@@ -235,6 +325,11 @@ REGOLE TASSATIVE:
 - promotore (se in lista):
   ON su: lancio prodotti/servizi/funzionalità; campagne/promozioni/offerte; inviti a eventi/webinar/conferenze; proposte di investimento o crescita aziendale.
   OFF su: contenuti puramente informativi/analitici senza CTA; critica diretta a concorrenti; crisi/tragedie/alta sensibilità sociale; promesse irrealistiche o fuorvianti.
+- informatore (se in lista):
+  ON su: comunicati neutri, presenza a eventi, aggiornamenti operativi, note di disponibilità senza obiettivo commerciale.
+  OFF su: contenuti con conversione commerciale, attrito polemico, storytelling competitivo o promesse di beneficio.
+  Se informatore è ON: promotore/provocatore/visionario/narratore devono essere OFF.
+  metodologico resta ON solo se il contenuto spiega un processo; altrimenti OFF.
 - Politica, business, tech, scienza, attualità: toni punchy ON (salvo regole OFF sopra).
 
 OUTPUT JSON RIGIDO conforme allo schema.`;
@@ -256,7 +351,7 @@ OUTPUT JSON RIGIDO conforme allo schema.`;
       },
     }),
     topic,
-    { enabledTones },
+    { enabledTones, currentYear, previousYear },
   );
   const { diagnosi, plan = [], search_required, tone_suitability } = parsed;
 

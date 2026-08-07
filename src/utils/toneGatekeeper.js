@@ -19,6 +19,11 @@ export const LOCK_REASONS = {
   promotore_sensitive: 'Tono inappropriato su crisi o alta sensibilità',
   promotore_ethics: 'Prism non denigra concorrenti o prodotti altrui',
   promotore_honesty: 'Persuasione deve restare legata a fatti reali',
+  informatore: 'Tono adatto solo a comunicazioni neutre e non commerciali',
+  informatore_overrides_promotore: 'Contenuto informativo: evita spinta commerciale',
+  informatore_overrides_provocatore: 'Contenuto informativo: evita frizione editoriale',
+  informatore_overrides_visionario: 'Contenuto informativo: evita registro aspirazionale',
+  informatore_overrides_narratore: 'Contenuto informativo: evita storytelling',
 };
 
 /** Toni sempre disponibili, senza eccezioni editoriali */
@@ -197,6 +202,64 @@ const PROMOTORE_ANALYTICAL_PATTERNS = [
   /\brassegna\b/,
 ];
 
+/** Fit informatore: annuncio neutro, presenza evento, aggiornamento operativo */
+const INFORMATORE_FIT_PATTERNS = [
+  /\bsaremo presenti\b/,
+  /\bci vediamo\b/,
+  /\bannunciamo\b/,
+  /\baggiornamento operativo\b/,
+  /\bavviso\b/,
+  /\bdisponibilit/,
+  /\borari?\b/,
+  /\bquando\b/,
+  /\bdove\b/,
+  /\bstand\b/,
+  /\bpadiglione\b/,
+  /\bcabina\b/,
+  /\bevento\b/,
+  /\bfiera\b/,
+  /\bconvegno\b/,
+];
+
+/** Segnali di conversione commerciale incompatibili con informatore puro */
+const INFORMATORE_COMMERCIAL_PATTERNS = [
+  /\bdemo\b/,
+  /\brichiedi\b/,
+  /\bacquista\b/,
+  /\bprenota\b/,
+  /\bofferta\b/,
+  /\bsconto\b/,
+  /\bpromo(zion[ei])?\b/,
+  /\blead\b/,
+  /\bconversione\b/,
+  /\bcall to action\b/,
+  /\bcta\b/,
+];
+
+/** Segnali di attrito/competizione: informatore dovrebbe evitarli */
+const INFORMATORE_FRICTION_PATTERNS = [
+  /\bpessim[oa]\b/,
+  /\bfalliment/,
+  /\bcontro\b/,
+  /\bvs\b/,
+  /\battacc/,
+  /\bdenigr/,
+  /\bcompetitor\b/,
+];
+
+/** Segnali espliciti di spiegazione processo (metodologico) */
+const PROCESS_EXPLANATION_PATTERNS = [
+  /\bprocesso\b/,
+  /\bprocedura\b/,
+  /\bstep\b/,
+  /\bpassaggi\b/,
+  /\bchecklist\b/,
+  /\bprotocollo\b/,
+  /\bworkflow\b/,
+  /\bcome fare\b/,
+  /\bcome implementare\b/,
+];
+
 /** Tema puramente storico → spegne visionario */
 const HISTORICAL_PATTERNS = [
   /\barcheolog/,
@@ -271,6 +334,10 @@ export const classifyTopicForTones = (topic) => {
   const isUnrealisticPromise = anyMatch(text, PROMOTORE_UNREALISTIC_PATTERNS);
   const isPureAnalytical =
     anyMatch(text, PROMOTORE_ANALYTICAL_PATTERNS) && !isPromotoreFit;
+  const isInformatoreFit = anyMatch(text, INFORMATORE_FIT_PATTERNS);
+  const hasCommercialIntent = anyMatch(text, INFORMATORE_COMMERCIAL_PATTERNS);
+  const hasFrictionSignals = anyMatch(text, INFORMATORE_FRICTION_PATTERNS);
+  const hasProcessExplanation = anyMatch(text, PROCESS_EXPLANATION_PATTERNS);
 
   return {
     isPolitical,
@@ -282,6 +349,10 @@ export const classifyTopicForTones = (topic) => {
     isCompetitorAttack,
     isUnrealisticPromise,
     isPureAnalytical,
+    isInformatoreFit,
+    hasCommercialIntent,
+    hasFrictionSignals,
+    hasProcessExplanation,
   };
 };
 
@@ -371,6 +442,40 @@ export const enforceToneSuitability = (topic, tones = {}, opts = {}) => {
     } else {
       // Dubbio senza fit commerciale → OFF (non sprecare conversione)
       out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.promotore);
+    }
+  }
+
+  // Informatore: ON solo se l'obiettivo è neutro/non commerciale.
+  if (has('informatore')) {
+    if (
+      flags.isInformatoreFit &&
+      !flags.hasCommercialIntent &&
+      !flags.hasFrictionSignals &&
+      !flags.isPromotoreFit
+    ) {
+      out.informatore = forceOn(out.informatore || {});
+    } else {
+      out.informatore = forceOff(out.informatore || {}, LOCK_REASONS.informatore);
+    }
+  }
+
+  // Quando informatore è ON, disattiva i toni non coerenti col registro neutro.
+  if (out.informatore?.status === 'ON') {
+    if (has('promotore')) {
+      out.promotore = forceOff(out.promotore || {}, LOCK_REASONS.informatore_overrides_promotore);
+    }
+    if (has('provocatore')) {
+      out.provocatore = forceOff(out.provocatore || {}, LOCK_REASONS.informatore_overrides_provocatore);
+    }
+    if (has('visionario')) {
+      out.visionario = forceOff(out.visionario || {}, LOCK_REASONS.informatore_overrides_visionario);
+    }
+    if (has('narratore')) {
+      out.narratore = forceOff(out.narratore || {}, LOCK_REASONS.informatore_overrides_narratore);
+    }
+    // Metodologico resta ON solo se il topic parla esplicitamente di processo.
+    if (has('metodologico') && !flags.hasProcessExplanation) {
+      out.metodologico = forceOff(out.metodologico || {}, LOCK_REASONS.metodologico);
     }
   }
 

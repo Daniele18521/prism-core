@@ -6,8 +6,9 @@
  * - CONTESTO: inquadramento
  * - SFIDE_OPPORTUNITA: rischi e opportunità
  *
- * Include validazione anti-allucinazione: scarta frasi con date/numeri
- * non presenti nelle fonti originali.
+ * Vincoli:
+ * - anti-allucinazione (date/numeri devono essere nelle fonti)
+ * - pertinenza all'INPUT UTENTE (scarta fatti veri ma fuori tema)
  */
 
 // Carica variabili d'ambiente da .env
@@ -237,11 +238,11 @@ export const refineResults = async (topic, {
     .slice(0, 5)
     .map(({ sourceId, title, url }) => ({ sourceId, title, url }));
 
-  // Prompt di sintesi: generico per qualsiasi argomento
+  // Prompt di sintesi: generico + ancorato all'argomento di input
   const promptText = `Sei l'analista senior di PRISM. Produci un report strutturato in tre pilastri editoriali.
 Estrai SOLO informazioni presenti nelle fonti o nell'input utente. Non inferire, non arricchire, non correggere le fonti.
 
-INPUT UTENTE:
+INPUT UTENTE (ARGOMENTO VINCOLANTE):
 "${topic}"
 
 DIAGNOSI GAP (OK = usa input utente al 100% | GAP = usa pacchetti web):
@@ -253,31 +254,63 @@ PACCHETTI WEB (obbligatori per pilastri GAP):
 ${webContext}
 ---
 
-STRUTTURA OUTPUT (TASSATIVA):
-- compressedFacts deve contenere ESATTAMENTE 3 stringhe, una per pilastro, in questo ordine:
+[PRE-FLIGHT — NON STAMPARE]
+1) Estrai il NUCLEO TEMATICO dell'INPUT UTENTE:
+   - soggetto specifico + predicato/tesi + ambito d'uso specifico.
+2) Distingui NUCLEO vs DOMINIO-PADRE:
+   - NUCLEO = ciò che l'utente chiede davvero.
+   - DOMINIO-PADRE = categoria più ampia (contiguità tematica).
+3) Nei pilastri ammetti SOLO fatti sul NUCLEO.
+   Fatti sul solo DOMINIO-PADRE = FUORI TEMA → scarta.
+
+Esempio di principio (qualsiasi argomento):
+se l'input chiede un uso/caso specifico, NON riempire i pilastri con limiti generici del dominio tecnico o con framework enterprise contigui, salvo che la fonte li colleghi ESPLICITAMENTE a quel caso d'uso.
+
+[PERTINENZA VERTICALE — HARD FAIL]
+Un fatto è AMMESSO solo se supera TUTTI i test:
+A) È presente in fonte (o input) — document-bound.
+B) Aiuta a rispondere / sostenere / chiarire il NUCLEO dell'INPUT.
+C) Resterebbe inutile o fuorviante se l'utente avesse chiesto un altro tema dello stesso dominio-padre.
+D) Non è un riempitivo "interessante ma laterale".
+
+Se un fatto fallisce anche uno solo di A–D → NON includerlo.
+
+Vietato (salvo richiesta esplicita nell'input):
+- limiti generici di capacità di un dominio tecnico non verticalizzati sul caso d'uso dell'input;
+- framework di adozione/orchestrazione/processi enterprise non legati al nucleo;
+- macro-trend, geopolitica, benchmark contigui non collegati al nucleo;
+- esempi aneddotici fuori perimetro (anche se citabili).
+
+[STRUTTURA OUTPUT — TASSATIVA]
+- compressedFacts: ESATTAMENTE 3 stringhe, ordine fisso:
   1. "SCENARIO: …"
   2. "CONTESTO: …"
   3. "SFIDE_OPPORTUNITA: …"
-- Ogni stringa è UN UNICO blocco di testo continuo (un paragrafo coeso), NON un elenco puntato e NON più voci separate per lo stesso pilastro.
-- Non duplicare prefissi: ogni pilastro compare una sola volta.
+- Ogni stringa = UN paragrafo continuo (no elenco, no prefissi duplicati).
 
-REGOLE PER PILASTRO:
-- SCENARIO (OK → input utente | GAP → fonti web): fatti osservabili, dati quantitativi, eventi concreti.
-- CONTESTO (OK → input utente | GAP → fonti web): inquadramento, trend, posizionamento nel settore o nella cronologia.
-- SFIDE_OPPORTUNITA (OK → input utente | GAP → fonti web): ostacoli, rischi, leve e opportunità esplicitamente menzionati.
+[REGOLE PER PILASTRO — TUTTI E TRE SUL NUCLEO]
+- SCENARIO: prove/fatti concreti che sostengono la tesi o il problema ESPRESSO nell'input.
+  Domanda-guida: "Quali evidenze dimostrano proprio QUESTO punto?"
+- CONTESTO: inquadramento dello stesso nucleo (perché conta in quel perimetro specifico).
+  Domanda-guida: "In che cornice ha senso QUESTO argomento (non il dominio-padre)?"
+- SFIDE_OPPORTUNITA: criticità/leve operative dello stesso nucleo.
+  Domanda-guida: "Quali rischi/leve emergono da QUESTO problema?"
 
-FEDELTÀ ALLE FONTI (PRIORITÀ ASSOLUTA):
-- Ogni dato da web deve avere citazione [S1], [S2], ecc. corrispondente al pacchetto sorgente.
-- Non inventare date, numeri, nomi, percentuali, cause o conseguenze assenti nelle fonti.
-- Non convertire espressioni temporali relative in date assolute (es. "ultimo trimestre" ≠ data calcolata).
-- Mantieni il grado di certezza del testo originale (condizionali, attribuzioni, stime, "secondo").
-- Non fondere in una frase dati provenienti da fonti diverse.
-- Ignora contenuti promozionali, banner e testo non editoriale nelle pagine web.
-- Se un pilastro GAP non ha dati nelle fonti, restituisci comunque la voce con testo vuoto dopo il prefisso (es. "SCENARIO: ").
+Se SCENARIO o CONTESTO non hanno fatti verticali nelle fonti → prefisso + testo vuoto.
+NON compensare con materiale del dominio-padre.
+isContextRelevant = false se le fonti utili sul nucleo sono minoritarie.
+
+FEDELTÀ ALLE FONTI:
+- Ogni dato web termina con citazione [Sx] prima del punto.
+- Non inventare date/numeri/nomi/cause assenti.
+- Non convertire tempi relativi in date assolute.
+- Mantieni certezza originale (condizionali, stime, attribuzioni).
+- Non fondere in una frase dati di fonti diverse.
+- Ignora promo/banner/non editoriale.
 
 TRACCIABILITÀ:
-- Dati da web: ogni affermazione fattuale termina con [Sx] prima del punto.
-- Dati da input utente (pilastro OK): nessun tag [Sx].
+- Web: [Sx] obbligatorio.
+- Input utente (pilastro OK): nessun [Sx].
 
 OUTPUT JSON:
 {

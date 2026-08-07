@@ -18,6 +18,7 @@ const geminiFalseOff = () => ({
   visionario: { status: 'ON', lock_reason: '' },
   metodologico: { status: 'ON', lock_reason: '' },
   narratore: { status: 'ON', lock_reason: '' },
+  informatore: { status: 'OFF', lock_reason: '' },
 });
 
 describe('toneGatekeeper — classifyTopicForTones', () => {
@@ -150,6 +151,37 @@ describe('toneGatekeeper — enforceToneSuitability', () => {
     );
     assert.equal(out.promotore.status, 'OFF');
     assert.equal(out.promotore.lock_reason, LOCK_REASONS.promotore_ethics);
+  });
+
+  test('presenza evento neutra → informatore ON e override toni non coerenti', () => {
+    const out = enforceToneSuitability(
+      'Saremo presenti a Coiltech 2026 a Pordenone. Ci vediamo allo stand 6-C12.',
+      {
+        provocatore: { status: 'ON', lock_reason: '' },
+        confidente: { status: 'ON', lock_reason: '' },
+        sferzante: { status: 'ON', lock_reason: '' },
+        visionario: { status: 'ON', lock_reason: '' },
+        metodologico: { status: 'ON', lock_reason: '' },
+        narratore: { status: 'ON', lock_reason: '' },
+        promotore: { status: 'ON', lock_reason: '' },
+        informatore: { status: 'OFF', lock_reason: '' },
+      },
+    );
+    assert.equal(out.informatore.status, 'ON');
+    assert.equal(out.promotore.status, 'OFF');
+    assert.equal(out.provocatore.status, 'OFF');
+    assert.equal(out.visionario.status, 'OFF');
+    assert.equal(out.narratore.status, 'OFF');
+    assert.equal(out.metodologico.status, 'OFF');
+  });
+
+  test('evento con leva commerciale esplicita → informatore OFF', () => {
+    const out = enforceToneSuitability(
+      'Saremo presenti in fiera: richiedi la demo e prenota ora la tua consulenza.',
+      { informatore: { status: 'ON', lock_reason: '' } },
+    );
+    assert.equal(out.informatore.status, 'OFF');
+    assert.equal(out.informatore.lock_reason, LOCK_REASONS.informatore);
   });
 
   test('business generico → tutti ON anche se Gemini spegne', () => {
